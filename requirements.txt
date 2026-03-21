@@ -1,0 +1,9 @@
+ipykernel
+nbconvert
+nbformat
+matplotlib
+numpy
+pandas
+scipy
+seaborn
+statsmodels

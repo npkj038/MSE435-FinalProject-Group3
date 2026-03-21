@@ -9,7 +9,7 @@ Implements:
   • KPI reporting and Gantt-style schedule printing
 
 Run:
-    python exam_room_scheduler.py --csv AppointmentDataWeek1.csv [--day 11-10-2025]
+    python exam_room_scheduler.py --csv data/AppointmentDataWeek1.csv [--day 11-10-2025]
 """
 
 import argparse
@@ -1505,7 +1505,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="MSE 435 Examination Room Scheduler – Policies A–F"
     )
-    parser.add_argument("--csv", default="AppointmentDataWeek1.csv",
+    parser.add_argument("--csv", default="data/AppointmentDataWeek1.csv",
                         help="Path to appointment CSV file")
     parser.add_argument("--day", default=None,
                         help="Filter to a single date (MM-DD-YYYY), e.g. 11-10-2025")
