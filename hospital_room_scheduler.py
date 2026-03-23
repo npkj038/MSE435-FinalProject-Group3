@@ -1652,3 +1652,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(csv_path=args.csv, day_filter=args.day, max_cg_iters=args.cg_iters,
          print_matrices=args.print_matrices)
+    
+    # The use of GEN-AI was used to assist in coding up the column generation formulation, MP, and the policies A-F.
