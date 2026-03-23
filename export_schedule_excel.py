@@ -421,7 +421,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export schedule to Excel")
     parser.add_argument("--csv",  default="AppointmentDataWeek1.csv")
     parser.add_argument("--day",  default=None)
-    parser.add_argument("--out",  default="schedule_output2.xlsx")
+    parser.add_argument("--out",  default="schedule_output.xlsx")
     parser.add_argument("--cg-iters", type=int, default=1)
     args = parser.parse_args()
     main(args.csv, args.day, args.out, args.cg_iters)

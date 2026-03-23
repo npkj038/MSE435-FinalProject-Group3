@@ -9,7 +9,7 @@ Implements:
   • KPI reporting and Gantt-style schedule printing
 
 Run:
-    python hospital_room_scheduler.py --csv data/AppointmentDataWeek1.csv [--day 11-10-2025]
+    python exam_room_scheduler.py --csv AppointmentDataWeek1.csv [--day 11-10-2025]
 """
 
 import argparse
@@ -254,35 +254,16 @@ def solve_pricing_subproblem(
     rooms: List[int],
     duals_coverage: Dict[int, float],
     dual_assignment: float,
+    single_room: bool = False,
 ) -> Optional[Tuple[Dict[int, int], float]]:
     """
     Pricing sub-problem (column generation oracle).
 
-    Finds the single feasible assignment pattern with the most negative
-    reduced cost, defined as:
-
-        RC(h) = cost^h_{dp}  -  Σ_{k∈K_{dp}} μ_k · a^h_{dp,k}  -  λ_{dp}
-
-    where:
-        cost^h_{dp}   = travel distance of pattern h
-        μ_k           = dual variable for coverage constraint of appointment k
-        a^h_{dp,k}    = 1 if pattern h covers appointment k (always 1 here
-                        since every active appointment must be assigned)
-        λ_{dp}        = dual variable for the assignment constraint of (p,d)
-
-    This is solved via branch-and-bound over room assignments, processing
-    appointments in chronological order.  Because appointments are independent
-    across rooms (a room conflict only arises from time overlap), the search
-    tree is pruned whenever the partial reduced cost already exceeds the
-    best complete RC found so far.
-
-    Feasibility rules enforced:
-      1. Every appointment is assigned to exactly one room.
-      2. No two overlapping appointments share a room.
-      3. Appointments in blocked admin/lunch windows are excluded.
-
-    Returns (assignment_dict, reduced_cost) for the best pattern found,
-    or None if no feasible pattern exists.
+    single_room=True enforces the Policy A day-variant column feasibility
+    constraint: the pricing oracle only considers patterns where all
+    appointments are assigned to the same room r.  The search reduces to
+    finding the single room r that minimises the reduced cost, which is
+    simply: RC(r) = 0 - total_dual  (travel cost is always 0 for single-room).
     """
     blocks = blocked_windows(date)
 
@@ -297,9 +278,35 @@ def solve_pricing_subproblem(
     n = len(valid_appts)
 
     # Dual contribution that every complete pattern earns just by existing:
-    # Σ_k μ_k  +  λ_{dp}   (since a^h_{dp,k} = 1 for all k in a complete pattern)
+    # Σ_k μ_k  +  λ_{dp}
     total_dual = sum(duals_coverage.get(a.appt_id, 0.0) for a in valid_appts) \
                  + dual_assignment
+
+    # ── Policy A day-variant fast path ───────────────────────────────────────
+    # When single_room=True the column feasibility constraint restricts H_{d,p}
+    # to patterns where every appointment is in the same room r.
+    # Travel cost is always 0 for such patterns (no room switches).
+    # RC(r) = 0 - total_dual  for any feasible single room r.
+    # We just need to find one room where all appointments fit (no overlaps).
+    if single_room:
+        # Check if appointments are mutually non-overlapping (required for
+        # single-room feasibility — two overlapping appointments cannot share
+        # a room simultaneously).
+        feasible_single = True
+        occupied_until = 0
+        for a in valid_appts:
+            if a.start_min < occupied_until:
+                feasible_single = False
+                break
+            occupied_until = a.end_min
+
+        if not feasible_single:
+            return None  # no single-room pattern exists
+
+        # All rooms are equally good (RC = 0 - total_dual); return room 1
+        rc = 0.0 - total_dual
+        assignment = {a.appt_id: rooms[0] for a in valid_appts}
+        return assignment, rc
 
     # Best reduced cost found so far (we want the most negative)
     best_rc: List[float] = [float("inf")]
@@ -421,22 +428,29 @@ def generate_initial_patterns(
     rooms: List[int] = ROOMS,
     n_initial: int = 50,
     seed: int = 0,
+    single_room: bool = False,
 ) -> List[Pattern]:
     """
     Generate a diverse set of good initial patterns for the MP.
+
+    single_room=True enforces the Policy A day-variant column feasibility
+    constraint: every appointment in pattern h must be assigned to the
+    same room r.  This restricts H_{d,p} to only single-room patterns,
+    which is equivalent to adding the feasibility rule at column generation
+    time rather than as a post-hoc assignment.
 
     Strategy (in order, deduplicating throughout):
       1. Single-room patterns  — one per room, zero travel, feasible only
          when no two appointments in the schedule overlap.
       2. Greedy nearest-room   — for each room as anchor, always pick the
          closest free room to the previous one.  Gives low-cost patterns.
+         (skipped when single_room=True since step 1 covers all cases)
       3. Greedy room-pinned    — for each room r, always prefer r when it
          is free, fall back to nearest otherwise.  Diverse room usage.
+         (skipped when single_room=True)
       4. Randomised greedy     — repeated random-jitter greedy passes to
          fill up to n_initial distinct patterns.
-
-    The result is a varied column pool that gives the LP relaxation a
-    realistic feasible basis without enumerating combinatorially.
+         (skipped when single_room=True)
     """
     blocks = blocked_windows(date)
     valid_appts = sorted(
@@ -455,6 +469,11 @@ def generate_initial_patterns(
         nonlocal pid
         if assignment is None:
             return False
+        # ── Column feasibility constraint (Policy A day variant) ─────────────
+        # If single_room=True, reject any pattern that uses more than one room.
+        # This enforces: all i ∈ A_{d,p} must map to the same room r in h.
+        if single_room and len(set(assignment.values())) > 1:
+            return False
         sig = frozenset(assignment.items())
         if sig in seen:
             return False
@@ -465,6 +484,9 @@ def generate_initial_patterns(
         return True
 
     # ── 1. Single-room patterns (zero travel) ────────────────────────────────
+    # These are the ONLY feasible patterns when single_room=True.
+    # One pattern per room r: all appointments assigned to r.
+    # Feasible only when no two appointments in the schedule overlap in time.
     for r in rooms:
         occupied_until = 0
         ok = True
@@ -476,23 +498,25 @@ def generate_initial_patterns(
         if ok:
             add({a.appt_id: r for a in valid_appts})
 
-    # ── 2. Greedy nearest-room (one per anchor room) ─────────────────────────
-    for start_room in rooms:
-        add(_greedy_pattern(valid_appts, rooms, start_room))
+    # Steps 2–4 only run when single_room=False (multi-room patterns allowed)
+    if not single_room:
+        # ── 2. Greedy nearest-room (one per anchor room) ─────────────────────
+        for start_room in rooms:
+            add(_greedy_pattern(valid_appts, rooms, start_room))
 
-    # ── 3. Greedy room-pinned (prefer room r, fall back when busy) ───────────
-    for preferred in rooms:
-        add(_greedy_pattern(valid_appts, rooms,
-                            start_room=preferred, preferred_room=preferred))
+        # ── 3. Greedy room-pinned (prefer room r, fall back when busy) ───────
+        for preferred in rooms:
+            add(_greedy_pattern(valid_appts, rooms,
+                                start_room=preferred, preferred_room=preferred))
 
-    # ── 4. Randomised greedy to reach n_initial distinct patterns ────────────
-    attempts = 0
-    while len(patterns) < n_initial and attempts < n_initial * 10:
-        attempts += 1
-        start_room = int(rng.choice(rooms))
-        preferred  = int(rng.choice(rooms))
-        add(_greedy_pattern(valid_appts, rooms, start_room,
-                            preferred_room=preferred, rng=rng))
+        # ── 4. Randomised greedy to reach n_initial distinct patterns ─────────
+        attempts = 0
+        while len(patterns) < n_initial and attempts < n_initial * 10:
+            attempts += 1
+            start_room = int(rng.choice(rooms))
+            preferred  = int(rng.choice(rooms))
+            add(_greedy_pattern(valid_appts, rooms, start_room,
+                                preferred_room=preferred, rng=rng))
 
     return patterns
 
@@ -500,12 +524,15 @@ def generate_initial_patterns(
 def generate_patterns(appts: List[Appointment],
                        provider: str,
                        date: str,
-                       rooms: List[int] = ROOMS) -> List[Pattern]:
+                       rooms: List[int] = ROOMS,
+                       single_room: bool = False) -> List[Pattern]:
     """
     Wrapper used for initial pattern generation.
-    Returns a compact set of good starting patterns (not full enumeration).
+    single_room=True enforces the Policy A day-variant column feasibility
+    constraint throughout the CG pipeline.
     """
-    return generate_initial_patterns(appts, provider, date, rooms)
+    return generate_initial_patterns(appts, provider, date, rooms,
+                                     single_room=single_room)
 
 
 def feasible_room_assignment(
@@ -894,6 +921,7 @@ def column_generation(
     patterns_map: Dict[Tuple[str, str], List[Pattern]],
     max_iterations: int = 10,
     print_matrices: bool = False,
+    single_room: bool = False,
 ) -> Dict[Tuple[str, str], List[Pattern]]:
     """
     Column generation loop.
@@ -1007,6 +1035,7 @@ def column_generation(
                 rooms=ROOMS,
                 duals_coverage=duals_coverage,
                 dual_assignment=duals_assignment.get((prov, date), 0.0),
+                single_room=single_room,
             )
 
             if result is None:
@@ -1105,13 +1134,20 @@ def display_schedule(chosen: Dict[Tuple[str, str], Pattern],
               f"{'Dur':>4}  {'Room':>4}  {'Type':<20}")
         print(f"  {'-'*6}  {'-'*12}  {'-'*5}  {'-'*4}  {'-'*4}  {'-'*20}")
 
+        blocks = blocked_windows(date)
         for a in appts:
-            room = pat.assignment.get(a.appt_id, "?")
+            room = pat.assignment.get(a.appt_id)
+            if room is not None:
+                room_str = f"ER{room:>2}"
+            elif not is_available(a.start_min, a.end_min, blocks):
+                room_str = "BLOCKED"
+            else:
+                room_str = "UNASSIGNED"
             h, m = divmod(a.start_min, 60)
             ns_flag = "[NS]" if a.no_show else ""
             print(f"  {a.appt_id:>6}  {a.patient_id:<12}  "
                   f"{h:02d}:{m:02d}  {a.duration:>4}  "
-                  f"ER{str(room):>2}  {a.appt_type:<20} {ns_flag}")
+                  f"{room_str:<10}  {a.appt_type:<20} {ns_flag}")
 
     print("\n" + "=" * 72)
 
@@ -1124,51 +1160,65 @@ def display_schedule(chosen: Dict[Tuple[str, str], Pattern],
 def policy_a_single_room(
     groups: Dict[Tuple[str, str], List[Appointment]],
     week_lock: bool = False,
+    cg_iters: int = 3,
 ) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
     """
-    Policy A: Assign each Healthcare Provider to ONE dedicated room for the
-    entire day (week_lock=False) or the entire week (week_lock=True).
+    Policy A – Day variant: Assign each provider to a single room for the day.
 
-    When week_lock=True the same room number is re-used across all days for
-    a given provider, simulating a permanently assigned room.
+    Implemented as a column feasibility constraint added to the pattern
+    generator and pricing sub-problem, so it flows through the full CG
+    pipeline.  H_{d,p} is restricted to patterns where every appointment
+    i ∈ A_{d,p} is assigned to the same room r — enforcing:
 
-    Cost = 0 (no room switches ever occur).
+        Σ_r x_{ird} = 1  ∀i, d   (exactly one room per provider per day)
+
+    with the additional feasibility rule that all appointments in the
+    pattern share that one room.
+
+    Week variant (week_lock=True): after solving independently per day,
+    a post-processing step enforces the same room across all days for
+    each provider by taking the most-used room from the day solutions.
+    Full week-variant CG requires the β_{p,r} binary variable extension
+    to the MP (not yet implemented).
     """
-    chosen: Dict[Tuple[str, str], Pattern] = {}
-    total_cost = 0.0
-    pid = 0
-
-    # If locking per week, pre-assign one room per provider
-    provider_room: Dict[str, int] = {}
-    room_counter = iter(ROOMS)
-
-    for (prov, date), appts in sorted(groups.items()):
+    # ── Build initial patterns with single-room constraint ───────────────────
+    patterns_map: Dict[Tuple[str, str], List[Pattern]] = {}
+    for (prov, date), appts in groups.items():
         active = [a for a in appts if a.is_active]
-        if not active:
-            continue
+        if active:
+            patterns_map[(prov, date)] = generate_initial_patterns(
+                active, prov, date, single_room=True
+            )
 
-        if week_lock:
-            if prov not in provider_room:
-                try:
-                    provider_room[prov] = next(room_counter)
-                except StopIteration:
-                    provider_room[prov] = ROOMS[0]  # wrap-around
-            r = provider_room[prov]
-        else:
-            # Pick the first room that has no time conflict with other providers
-            # already assigned to that room on that day.
-            used_rooms_today = {
-                p.assignment[list(p.assignment.keys())[0]]
-                for (pr, dt), p in chosen.items()
-                if dt == date and p.assignment
-            }
-            r = next((rm for rm in ROOMS if rm not in used_rooms_today), ROOMS[0])
+    # ── Run CG with single-room pricing oracle ───────────────────────────────
+    patterns_map = column_generation(
+        groups, patterns_map, max_iterations=cg_iters, single_room=True
+    )
 
-        assignment = {a.appt_id: r for a in active}
-        pat = Pattern(pid, prov, date, assignment, cost=0.0)
-        chosen[(prov, date)] = pat
-        pid += 1
+    # ── Solve the restricted MIP ─────────────────────────────────────────────
+    obj, chosen = build_and_solve_master(groups, patterns_map, integer=True)
 
+    # ── Week variant post-processing ─────────────────────────────────────────
+    # Lock every provider to their most-used room across all days.
+    if week_lock:
+        from collections import Counter
+        provider_rooms: Dict[str, Counter] = defaultdict(Counter)
+        for (prov, date), pat in chosen.items():
+            rooms_used = list(pat.assignment.values())
+            if rooms_used:
+                provider_rooms[prov].update(rooms_used)
+
+        # Re-assign each day's pattern to the provider's dominant room
+        pid = max((p.pattern_id for p in chosen.values()), default=0) + 1
+        for (prov, date), pat in list(chosen.items()):
+            dominant_r = provider_rooms[prov].most_common(1)[0][0]
+            new_assignment = {aid: dominant_r for aid in pat.assignment}
+            new_cost = compute_pattern_cost(new_assignment,
+                           [a for a in groups[(prov, date)] if a.is_active])
+            chosen[(prov, date)] = Pattern(pid, prov, date, new_assignment, new_cost)
+            pid += 1
+
+    total_cost = sum(p.cost for p in chosen.values())
     return total_cost, chosen
 
 
@@ -1573,8 +1623,183 @@ def run_all_policies(
     print()
 
 
+def export_gantt(
+    chosen: Dict[Tuple[str, str], Pattern],
+    groups: Dict[Tuple[str, str], List[Appointment]],
+    date_filter: Optional[str] = None,
+    output_path: str = "schedule_gantt.png",
+) -> None:
+    """
+    Export the schedule as a Gantt chart PNG.
+
+    Layout:
+      - One chart per day (saved as separate PNGs if multiple days).
+      - Y-axis: Exam rooms (ER1 … ER16).
+      - X-axis: Time of day (minutes from midnight → HH:MM labels).
+      - Each bar = one appointment, coloured by provider.
+      - Bars are labelled with Patient ID (truncated).
+      - Blocked admin/lunch windows shown as grey hatched bands.
+      - No-show appointments shown with diagonal hatching.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.patches import FancyBboxPatch
+
+    # Collect all dates to plot
+    dates = sorted({date for (_, date) in chosen.keys()
+                    if date_filter is None or date == date_filter})
+    if not dates:
+        print("  [Gantt] No schedule data to plot.")
+        return
+
+    # Colour palette — one colour per provider
+    all_providers = sorted({prov for (prov, _) in chosen.keys()})
+    cmap = plt.cm.get_cmap("tab20", max(len(all_providers), 1))
+    prov_colour = {p: cmap(i) for i, p in enumerate(all_providers)}
+
+    saved_files = []
+
+    for date in dates:
+        # Operating window for this day
+        blocks = blocked_windows(date)
+        day_start = 8 * 60    # 08:00
+        day_end   = 17 * 60   # 17:00
+
+        # Collect all bars for this date
+        bars = []   # (room, start_min, duration, provider, patient_id, no_show)
+        for (prov, d), pat in chosen.items():
+            if d != date:
+                continue
+            appts = groups.get((prov, d), [])
+            for a in appts:
+                room = pat.assignment.get(a.appt_id)
+                if room is None:
+                    continue
+                bars.append((room, a.start_min, a.duration,
+                             prov, a.patient_id, a.no_show))
+
+        if not bars:
+            continue
+
+        # Figure dimensions: one row per room used
+        rooms_used = sorted({b[0] for b in bars})
+        n_rooms = len(rooms_used)
+        room_to_y = {r: i for i, r in enumerate(rooms_used)}
+
+        fig_w = max(18, (day_end - day_start) / 30)
+        fig_h = max(6, n_rooms * 0.55 + 2)
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+        # ── Grey hatched bands for blocked windows ────────────────────────────
+        for (bs, be) in blocks:
+            ax.axvspan(bs, be, color="lightgrey", alpha=0.5,
+                       hatch="//", linewidth=0, zorder=0)
+            mid = (bs + be) / 2
+            label = "Admin" if (be - bs) <= 30 else "Lunch"
+            ax.text(mid, n_rooms - 0.3, label, ha="center", va="top",
+                    fontsize=6, color="grey", style="italic")
+
+        # ── Appointment bars ──────────────────────────────────────────────────
+        bar_h = 0.7
+        for (room, start, dur, prov, patient, no_show) in bars:
+            y = room_to_y[room]
+            colour = prov_colour[prov]
+
+            rect = FancyBboxPatch(
+                (start, y - bar_h / 2), dur, bar_h,
+                boxstyle="round,pad=1",
+                linewidth=0.6,
+                edgecolor="white",
+                facecolor=colour,
+                alpha=0.5 if no_show else 0.88,
+                zorder=2,
+            )
+            ax.add_patch(rect)
+
+            # Diagonal hatch for no-shows
+            if no_show:
+                hatch_rect = FancyBboxPatch(
+                    (start, y - bar_h / 2), dur, bar_h,
+                    boxstyle="round,pad=1",
+                    linewidth=0,
+                    edgecolor=colour,
+                    facecolor="none",
+                    hatch="xxx",
+                    zorder=3,
+                )
+                ax.add_patch(hatch_rect)
+
+            # Label inside bar (patient id, truncated)
+            if dur >= 8:
+                label = patient.replace("Patient ", "P")
+                ax.text(start + dur / 2, y, label,
+                        ha="center", va="center",
+                        fontsize=5.5, fontweight="bold",
+                        color="white", zorder=4, clip_on=True)
+
+        # ── Y-axis: room labels ───────────────────────────────────────────────
+        ax.set_yticks(range(n_rooms))
+        ax.set_yticklabels([f"ER{r}" for r in rooms_used], fontsize=8)
+        ax.set_ylim(-0.7, n_rooms - 0.3)
+
+        # ── X-axis: time labels ───────────────────────────────────────────────
+        tick_mins = list(range(day_start, day_end + 1, 30))
+        ax.set_xticks(tick_mins)
+        ax.set_xticklabels(
+            [f"{m // 60:02d}:{m % 60:02d}" for m in tick_mins],
+            rotation=45, ha="right", fontsize=7,
+        )
+        ax.set_xlim(day_start, day_end)
+        ax.set_xlabel("Time of Day", fontsize=9)
+        ax.set_ylabel("Exam Room", fontsize=9)
+
+        # ── Grid ─────────────────────────────────────────────────────────────
+        ax.set_axisbelow(True)
+        ax.xaxis.grid(True, linestyle="--", linewidth=0.4, alpha=0.5, zorder=1)
+        ax.yaxis.grid(True, linestyle="-", linewidth=0.3, alpha=0.3, zorder=1)
+
+        # ── Title ─────────────────────────────────────────────────────────────
+        ax.set_title(f"Examination Room Schedule — {date}",
+                     fontsize=12, fontweight="bold", pad=10)
+
+        # ── Legend: providers ─────────────────────────────────────────────────
+        providers_today = sorted({b[3] for b in bars})
+        legend_patches = [
+            mpatches.Patch(facecolor=prov_colour[p], label=p, alpha=0.88)
+            for p in providers_today
+        ]
+        # Add no-show indicator
+        legend_patches.append(
+            mpatches.Patch(facecolor="grey", hatch="xxx",
+                           label="No-Show", alpha=0.5)
+        )
+        ax.legend(handles=legend_patches, loc="upper right",
+                  fontsize=7, ncol=max(1, len(providers_today) // 6 + 1),
+                  framealpha=0.9, title="Provider", title_fontsize=7)
+
+        plt.tight_layout()
+
+        # ── Save ─────────────────────────────────────────────────────────────
+        if len(dates) == 1:
+            fname = output_path
+        else:
+            base, ext = output_path.rsplit(".", 1) if "." in output_path \
+                        else (output_path, "png")
+            fname = f"{base}_{date}.{ext}"
+
+        fig.savefig(fname, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        saved_files.append(fname)
+        print(f"  [Gantt] Saved: {fname}")
+
+    return saved_files
+
+
 def main(csv_path: str, day_filter: Optional[str] = None,
-         max_cg_iters: int = 3, print_matrices: bool = False) -> None:
+         max_cg_iters: int = 3, print_matrices: bool = False,
+         gantt: bool = False, gantt_path: str = "schedule_gantt.png") -> None:
     print(f"\nLoading appointments from: {csv_path}")
     all_appts = load_appointments(csv_path)
     print(f"  Loaded {len(all_appts)} appointments (after filtering 0-duration).")
@@ -1621,6 +1846,12 @@ def main(csv_path: str, day_filter: Optional[str] = None,
     # ── Display optimal schedule ──────────────────────────────────────────────
     display_schedule(chosen_opt, groups, date_filter=day_filter)
 
+    # ── Gantt chart export ────────────────────────────────────────────────────
+    if gantt:
+        print("\n=== Exporting Gantt Chart ===")
+        export_gantt(chosen_opt, groups,
+                     date_filter=day_filter, output_path=gantt_path)
+
     # ── KPIs for optimal ─────────────────────────────────────────────────────
     kpis_opt = compute_kpis(chosen_opt, groups)
     print("\n=== Optimal Schedule KPIs ===")
@@ -1641,16 +1872,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="MSE 435 Examination Room Scheduler – Policies A–F"
     )
-    parser.add_argument("--csv", default="data/AppointmentDataWeek1.csv",
+    parser.add_argument("--csv", default="AppointmentDataWeek1.csv",
                         help="Path to appointment CSV file")
     parser.add_argument("--day", default=None,
                         help="Filter to a single date (MM-DD-YYYY), e.g. 11-10-2025")
     parser.add_argument("--cg-iters", type=int, default=3,
                         help="Max column generation iterations (0 to skip CG)")
     parser.add_argument("--print-matrices", action="store_true",
-                        help="Print all CG matrices (cost vector, A matrix, solution vector, pattern detail) at each iteration")
+                        help="Print all CG matrices at each iteration")
+    parser.add_argument("--gantt", action="store_true",
+                        help="Export schedule as a Gantt chart PNG")
+    parser.add_argument("--gantt-path", default="schedule_gantt.png",
+                        help="Output path for Gantt PNG (default: schedule_gantt.png)")
     args = parser.parse_args()
     main(csv_path=args.csv, day_filter=args.day, max_cg_iters=args.cg_iters,
-         print_matrices=args.print_matrices)
+         print_matrices=args.print_matrices,
+         gantt=args.gantt, gantt_path=args.gantt_path)
     
     # The use of GEN-AI was used to assist in coding up the column generation formulation, MP, and the policies A-F.
