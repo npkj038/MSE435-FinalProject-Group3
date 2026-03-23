@@ -303,46 +303,72 @@ def write_policy_sheet(
 ) -> None:
     ws = wb.create_sheet(title="Policy Comparison")
 
-    ws.merge_cells("A1:G1")
+    ws.merge_cells("A1:H1")
     ws["A1"].value     = "Policy Comparison  –  Policies A–F  vs  Column Generation Optimal"
     ws["A1"].font      = _font(bold=True, color=CLR_WHITE, size=13)
     ws["A1"].fill      = _fill(CLR_HEADER_DARK)
     ws["A1"].alignment = _center()
 
     metrics = [
-        ("Total Travel (m)",          "total_travel_m"),
-        ("Room Switches",              "total_room_switches"),
-        ("Avg Travel/Provider-Day (m)","avg_travel_per_provider_day"),
-        ("Provider-Days Solved",       "provider_days_solved"),
-        ("Single-Room Days",           "provider_days_single_room"),
+        ("Total Travel (m)",           "total_travel_m"),
+        ("Room Switches",               "total_room_switches"),
+        ("Avg Travel/Provider-Day (m)", "avg_travel_per_provider_day"),
+        ("Provider-Days Solved",        "provider_days_solved"),
+        ("Single-Room Days",            "provider_days_single_room"),
     ]
-    col_headers = ["Policy"] + [m[0] for m in metrics]
+    col_headers = ["Policy"] + [m[0] for m in metrics] + ["Notes"]
     for col, h in enumerate(col_headers, start=1):
         _header_cell(ws, 2, col, h, dark=False)
 
     ws.column_dimensions["A"].width = 28
-    for col in range(2, len(col_headers) + 1):
-        ws.column_dimensions[get_column_letter(col)].width = 22
+    ws.column_dimensions[get_column_letter(len(col_headers))].width = 40
+    for col in range(2, len(col_headers)):
+        ws.column_dimensions[get_column_letter(col)].width = 20
 
     policies = [
-        ("Optimal (CG)",          None),
-        ("A – Single Room (day)", lambda g: policy_a_single_room(g, week_lock=False)),
-        ("A – Single Room (week)",lambda g: policy_a_single_room(g, week_lock=True)),
-        ("B – Cluster (≤3 m)",    lambda g: policy_b_cluster(g, proximity_threshold=3.0)),
-        ("B – Cluster (≤5 m)",    lambda g: policy_b_cluster(g, proximity_threshold=5.0)),
-        ("C – Blocked Days",      lambda g: policy_c_blocked_days(g)),
-        ("D – Admin Overflow ON", lambda g: policy_d_admin_overflow(g, allow_admin_overflow=True)),
-        ("D – Admin Overflow OFF",lambda g: policy_d_admin_overflow(g, allow_admin_overflow=False)),
-        ("E – Overbook (10% NS)", lambda g: policy_e_overbook(g)),
-        ("F – Uncertainty σ=20%", lambda g: policy_f_uncertainty(g)),
+        ("Optimal (CG)",
+         None,
+         "Column generation optimal — all 3 constraints enforced"),
+        ("A – Single Room (day)",
+         lambda g: policy_a_single_room(g, week_lock=False, cg_iters=1),
+         "H_{d,p} restricted to single-room patterns via CG feasibility constraint"),
+        ("A – Single Room (week)",
+         lambda g: policy_a_single_room(g, week_lock=True, cg_iters=1),
+         "Same as day variant with post-processing to enforce consistent weekly room"),
+        ("B – Cluster (≤3 m)",
+         lambda g: policy_b_cluster(g, proximity_threshold=3.0),
+         "K_{d,p} restricted to rooms within 3m of anchor — C_p constraint"),
+        ("B – Cluster (≤5 m)",
+         lambda g: policy_b_cluster(g, proximity_threshold=5.0),
+         "K_{d,p} restricted to rooms within 5m of anchor — C_p constraint"),
+        ("C – Blocked Days",
+         lambda g: policy_c_blocked_days(g),
+         "x_{ird} ≤ a_{id}: HPW114 unavailable on 11-11-2025"),
+        ("D – Admin Buffer ON (B=30min)",
+         lambda g: policy_d_admin_overflow(g, allow_admin_overflow=True,
+                                           admin_budget_minutes=30),
+         "MP Constraint (4): Σ τ_i · α ≤ B_d=30min per day"),
+        ("D – Admin Buffer OFF",
+         lambda g: policy_d_admin_overflow(g, allow_admin_overflow=False),
+         "Hard block: admin-window appointments excluded from pattern generator"),
+        ("E – Overbook (10% NS)",
+         lambda g: policy_e_overbook(g, no_show_rate=0.10),
+         "Σ x_{ird} ≤ capacity_r + δ_r: no-shows included in schedule"),
+        ("F – Buffer Factor μ=20%",
+         lambda g: policy_f_uncertainty(g, buffer_factor=0.20, cg_iters=1),
+         "d'_i = d_i(1+μ): buffered durations in preprocessing and CG only"),
+        ("F – Buffer Factor μ=10%",
+         lambda g: policy_f_uncertainty(g, buffer_factor=0.10, cg_iters=1),
+         "d'_i = d_i(1+μ): less conservative buffer for comparison"),
     ]
 
-    for r, (label, fn) in enumerate(policies, start=3):
+    for r, (label, fn, note) in enumerate(policies, start=3):
         if fn is None:
-            kpi = optimal_kpis
-            bg  = CLR_HEADER_LIGHT
+            kpi  = optimal_kpis
+            bg   = CLR_HEADER_LIGHT
             bold = True
         else:
+            print(f"    Running {label} ...")
             _, chosen = fn(groups)
             kpi  = compute_kpis(chosen, groups)
             bg   = CLR_ALT_ROW if r % 2 == 0 else CLR_WHITE
@@ -352,13 +378,14 @@ def write_policy_sheet(
             round(kpi.get(key, 0), 2) if isinstance(kpi.get(key, 0), float)
             else kpi.get(key, 0)
             for _, key in metrics
-        ]
+        ] + [note]
+
         for col, v in enumerate(row_vals, start=1):
             cell = ws.cell(row=r, column=col, value=v)
             cell.fill      = _fill(bg)
             cell.border    = BORDER_THIN
             cell.font      = _font(bold=bold, size=10)
-            cell.alignment = _left() if col == 1 else _center()
+            cell.alignment = _left() if col in (1, len(col_headers)) else _center()
 
     ws.freeze_panes = "B3"
 

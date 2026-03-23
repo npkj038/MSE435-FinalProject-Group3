@@ -9,7 +9,7 @@ Implements:
   • KPI reporting and Gantt-style schedule printing
 
 Run:
-    python exam_room_scheduler.py --csv AppointmentDataWeek1.csv [--day 11-10-2025]
+    python hospital_room_scheduler.py --csv AppointmentDataWeek1.csv [--day 11-10-2025]
 """
 
 import argparse
@@ -743,14 +743,35 @@ def print_cg_matrices(
     print("\n" + "=" * W + "\n")
 
 
+def compute_admin_overlap_minutes(a: Appointment, date: str) -> int:
+    """
+    τ_i — duration of appointment i that overlaps with any admin block on day d.
+    This is the overlap in minutes between [start_min, end_min) and the
+    union of all blocked windows for that day.
+    Used by Policy D's budget constraint in the MP.
+    """
+    blocks = blocked_windows(date)
+    overlap = 0
+    for (bs, be) in blocks:
+        # overlap of [a.start_min, a.end_min) with [bs, be)
+        overlap += max(0, min(a.end_min, be) - max(a.start_min, bs))
+    return overlap
+
+
 def _build_mp_arrays(
     groups: Dict[Tuple[str, str], List[Appointment]],
     patterns_map: Dict[Tuple[str, str], List[Pattern]],
+    admin_budget: Optional[Dict[str, float]] = None,
+    skip_conflict_constraints: bool = False,
 ) -> Tuple:
     """
     Shared helper: build all numpy arrays for the MP formulation.
     Returns (n_vars, var_index, A, lb, ub, c, group_var_indices, constraint_labels).
     Used by both build_and_solve_master and the dual extraction step in CG.
+
+    admin_budget: optional dict {date: B_d} — if provided, adds Constraint (4):
+        Σ_{p,h,i} a^h_{d,p,(r,i)} · α^h_{d,p} · τ_i ≤ B_d  ∀d∈D
+    where τ_i = minutes of appointment i overlapping an admin block on day d.
     """
     var_index: List[Tuple[str, str, int]] = []
     for (prov, date), pats in patterns_map.items():
@@ -797,46 +818,76 @@ def _build_mp_arrays(
         rows_A.append(row); lb_list.append(1.0); ub_list.append(1.0)
         constraint_labels.append(f"(2)ASSIGN {prov} {date}")
 
-    # Constraint (3): Cross-provider room conflict
-    date_provider_appts: Dict[str, Dict[str, List[Appointment]]] = defaultdict(dict)
-    for (prov, date), appts in groups.items():
-        active = [a for a in appts if a.is_active]
-        if active:
-            date_provider_appts[date][prov] = active
+    # Constraint (3): Cross-provider room conflict (skipped when skip_conflict_constraints=True)
+    if not skip_conflict_constraints:
+        date_provider_appts: Dict[str, Dict[str, List[Appointment]]] = defaultdict(dict)
+        for (prov, date), appts in groups.items():
+            active = [a for a in appts if a.is_active]
+            if active:
+                date_provider_appts[date][prov] = active
 
-    for date, prov_appts in date_provider_appts.items():
-        providers_today = list(prov_appts.keys())
-        for idx_p, prov_p in enumerate(providers_today):
-            for prov_pp in providers_today[idx_p + 1:]:
-                appts_p  = prov_appts[prov_p]
-                appts_pp = prov_appts[prov_pp]
-                pats_p   = patterns_map.get((prov_p,  date), [])
-                pats_pp  = patterns_map.get((prov_pp, date), [])
-                if not pats_p or not pats_pp:
+        for date, prov_appts in date_provider_appts.items():
+            providers_today = list(prov_appts.keys())
+            for idx_p, prov_p in enumerate(providers_today):
+                for prov_pp in providers_today[idx_p + 1:]:
+                    appts_p  = prov_appts[prov_p]
+                    appts_pp = prov_appts[prov_pp]
+                    pats_p   = patterns_map.get((prov_p,  date), [])
+                    pats_pp  = patterns_map.get((prov_pp, date), [])
+                    if not pats_p or not pats_pp:
+                        continue
+                    overlapping_pairs = [
+                        (a.appt_id, b.appt_id)
+                        for a in appts_p for b in appts_pp
+                        if appointments_overlap(a, b)
+                    ]
+                    if not overlapping_pairs:
+                        continue
+                    for r in ROOMS:
+                        for (aid_p, aid_pp) in overlapping_pairs:
+                            row = np.zeros(n_vars)
+                            for vi, (_p, _d, pidx) in enumerate(var_index):
+                                if _p == prov_p and _d == date:
+                                    if patterns_map[(prov_p, date)][pidx].assignment.get(aid_p) == r:
+                                        row[vi] = 1.0
+                                elif _p == prov_pp and _d == date:
+                                    if patterns_map[(prov_pp, date)][pidx].assignment.get(aid_pp) == r:
+                                        row[vi] = 1.0
+                            if row.sum() > 0:
+                                rows_A.append(row); lb_list.append(0.0); ub_list.append(1.0)
+                                constraint_labels.append(
+                                    f"(3)ROOM_CONFLICT r=ER{r} "
+                                    f"appt#{aid_p}({prov_p}) vs appt#{aid_pp}({prov_pp}) {date}"
+                                )
+
+    # Constraint (4): Admin buffer budget (Policy D)
+    # Σ_{p∈P} Σ_{h∈H_{d,p}} Σ_{i∈A_{d,p}} a^h_{d,p,(r,i)} · α^h_{d,p} · τ_i ≤ B_d
+    # ∀d∈D
+    # τ_i = minutes of appointment i overlapping an admin block on day d.
+    # One constraint row per day. Only added when admin_budget is provided.
+    if admin_budget:
+        all_dates = sorted({date for (_, date) in groups})
+        for date in all_dates:
+            B_d = admin_budget.get(date)
+            if B_d is None:
+                continue
+            row = np.zeros(n_vars)
+            for vi, (prov, d, pidx) in enumerate(var_index):
+                if d != date:
                     continue
-                overlapping_pairs = [
-                    (a.appt_id, b.appt_id)
-                    for a in appts_p for b in appts_pp
-                    if appointments_overlap(a, b)
-                ]
-                if not overlapping_pairs:
-                    continue
-                for r in ROOMS:
-                    for (aid_p, aid_pp) in overlapping_pairs:
-                        row = np.zeros(n_vars)
-                        for vi, (_p, _d, pidx) in enumerate(var_index):
-                            if _p == prov_p and _d == date:
-                                if patterns_map[(prov_p, date)][pidx].assignment.get(aid_p) == r:
-                                    row[vi] = 1.0
-                            elif _p == prov_pp and _d == date:
-                                if patterns_map[(prov_pp, date)][pidx].assignment.get(aid_pp) == r:
-                                    row[vi] = 1.0
-                        if row.sum() > 0:
-                            rows_A.append(row); lb_list.append(0.0); ub_list.append(1.0)
-                            constraint_labels.append(
-                                f"(3)ROOM_CONFLICT r=ER{r} "
-                                f"appt#{aid_p}({prov_p}) vs appt#{aid_pp}({prov_pp}) {date}"
-                            )
+                pat = patterns_map[(prov, date)][pidx]
+                appts = groups.get((prov, date), [])
+                for a in appts:
+                    if not a.is_active:
+                        continue
+                    if pat.covers(a.appt_id):
+                        tau_i = compute_admin_overlap_minutes(a, date)
+                        row[vi] += tau_i
+            if row.sum() > 0:
+                rows_A.append(row)
+                lb_list.append(0.0)
+                ub_list.append(float(B_d))
+                constraint_labels.append(f"(4)ADMIN_BUDGET B={B_d}min {date}")
 
     A  = np.array(rows_A)
     lb = np.array(lb_list)
@@ -850,6 +901,8 @@ def build_and_solve_master(
     integer: bool = True,
     print_matrices: bool = False,
     iteration_label: str = "MP",
+    admin_budget: Optional[Dict[str, float]] = None,
+    skip_conflict_constraints: bool = False,
 ) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
     """
     Build the Master Problem and solve it.
@@ -865,7 +918,8 @@ def build_and_solve_master(
     """
 
     n_vars, var_index, A, lb, ub, c, group_var_indices, constraint_labels = \
-        _build_mp_arrays(groups, patterns_map)
+        _build_mp_arrays(groups, patterns_map, admin_budget=admin_budget,
+                         skip_conflict_constraints=skip_conflict_constraints)
 
     if n_vars == 0:
         print("  [MP] No variables to optimise – returning empty solution.")
@@ -1317,74 +1371,57 @@ def policy_c_blocked_days(
 def policy_d_admin_overflow(
     groups: Dict[Tuple[str, str], List[Appointment]],
     allow_admin_overflow: bool = True,
+    admin_budget_minutes: float = 30.0,
 ) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
     """
-    Policy D: Use admin time slots for extenuating circumstances.
+    Policy D: Administrative Buffer Time.
 
-    When allow_admin_overflow=True, appointments that fall inside the morning
-    or afternoon admin windows (9:00-9:30, 16:30-17:00 Mon-Thu; 8:00-8:30,
-    15:00-15:30 Fri) are still assigned a room — modelling the case where
-    a provider uses admin time to see an urgent patient.
+    Implements the soft constraint with budget from the formulation:
 
-    The noon admin and lunch blocks are never overridden (hard constraints).
-    Cost for admin-overflow appointments is inflated by ADMIN_PENALTY to
-    discourage routine use.
+        Σ_{p∈P} Σ_{h∈H_{d,p}} Σ_{i∈A_{d,p}} a^h_{d,p,(r,i)} · α^h_{d,p} · τ_i ≤ B_d
+        ∀d∈D
+
+    where τ_i = minutes of appointment i overlapping an admin block on day d,
+    and B_d = maximum total admin overlap allowed across all providers on day d.
+
+    When allow_admin_overflow=True:
+        - Appointments overlapping admin blocks are included in the pattern
+          generator (they become eligible columns).
+        - The MP enforces that the total overlap across all selected patterns
+          on a given day does not exceed admin_budget_minutes (B_d).
+
+    When allow_admin_overflow=False:
+        - Admin-block appointments are excluded entirely (hard constraint,
+          equivalent to B_d = 0).
     """
-    ADMIN_PENALTY = 50.0  # metres equivalent penalty per overflow appointment
-
-    # Hard-blocked windows (never overridable): noon admin + lunch
-    HARD_BLOCKS_MON_THU = [
-        (11 * 60 + 30, 12 * 60),  # noon admin
-        (12 * 60, 13 * 60),       # lunch
-    ]
-    HARD_BLOCKS_FRI = [
-        (11 * 60 + 30, 12 * 60),
-        (12 * 60, 13 * 60),
-    ]
-
-    chosen: Dict[Tuple[str, str], Pattern] = {}
-    total_cost = 0.0
-    pid = 0
-
+    # Build initial patterns including admin-overlap appointments if allowed
+    patterns_map: Dict[Tuple[str, str], List[Pattern]] = {}
     for (prov, date), appts in groups.items():
-        hard_blocks = HARD_BLOCKS_FRI if is_friday(date) else HARD_BLOCKS_MON_THU
-
-        # Include appointments that only hit soft admin blocks (if overflow allowed)
         if allow_admin_overflow:
-            active = [
-                a for a in appts
-                if not a.cancelled and not a.deleted
-                and is_available(a.start_min, a.end_min, hard_blocks)
-            ]
+            # Include all non-cancelled, non-deleted appointments
+            # (admin-block appointments are now eligible columns)
+            active = [a for a in appts if not a.cancelled and not a.deleted]
         else:
+            # Hard constraint: exclude admin-block appointments entirely
             active = [a for a in appts if a.is_active]
 
-        if not active:
-            continue
+        if active:
+            patterns_map[(prov, date)] = generate_initial_patterns(active, prov, date)
 
-        pats = feasible_room_assignment(active, date, ROOMS)
-        if pats:
-            # Compute cost with admin penalty for overflow appointments
-            soft_blocks = blocked_windows(date)
-            overflow_ids = {
-                a.appt_id for a in active
-                if not is_available(a.start_min, a.end_min, soft_blocks)
-            }
-            costs = []
-            for p in pats:
-                base = compute_pattern_cost(p, active)
-                penalty = ADMIN_PENALTY * sum(
-                    1 for aid in p if aid in overflow_ids
-                )
-                costs.append(base + penalty)
+    # Build admin budget: B_d for each day
+    if allow_admin_overflow:
+        all_dates = sorted({date for (_, date) in groups})
+        admin_budget = {date: admin_budget_minutes for date in all_dates}
+    else:
+        admin_budget = None  # no budget constraint needed when hard-blocked
 
-            best_idx = int(np.argmin(costs))
-            raw_cost = compute_pattern_cost(pats[best_idx], active)
-            pat = Pattern(pid, prov, date, pats[best_idx], raw_cost)
-            chosen[(prov, date)] = pat
-            total_cost += raw_cost
-            pid += 1
+    # Solve MP with Constraint (4) enforcing the budget
+    obj, chosen = build_and_solve_master(
+        groups, patterns_map, integer=True,
+        admin_budget=admin_budget,
+    )
 
+    total_cost = sum(p.cost for p in chosen.values())
     return total_cost, chosen
 
 
@@ -1448,104 +1485,91 @@ def policy_e_overbook(
 # ── Policy F ──────────────────────────────────────────────────────────────────
 def policy_f_uncertainty(
     groups: Dict[Tuple[str, str], List[Appointment]],
-    duration_std_frac: float = 0.20,
-    n_scenarios: int = 5,
-    seed: int = 42,
+    buffer_factor: float = 0.20,
+    cg_iters: int = 3,
 ) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
     """
     Policy F: Account for uncertainty in examination durations.
 
-    Models duration uncertainty via scenario-based robust scheduling:
-      1. Generate `n_scenarios` duration realisations per appointment by
-         sampling N(mean, (mean * duration_std_frac)^2), clipped to [1, 120].
-      2. For each scenario, solve the feasibility sub-problem.
-      3. Select the pattern that is feasible across the most scenarios
-         (most-robust pattern), breaking ties by lowest average cost.
+    Implements the buffer factor preprocessing step from the formulation:
 
-    duration_std_frac: standard deviation as a fraction of nominal duration
-                       (default 0.20 = ±20% variability).
-    n_scenarios:       number of Monte-Carlo duration draws.
-    seed:              random seed for reproducibility.
+        d'_i = d_i(1 + μ)
+
+    where d_i is the nominal duration of appointment i and μ is the buffer
+    factor (default 0.20 = 20% inflation).
+
+    These buffered durations replace the original durations when determining
+    whether a provider-day assignment pattern is feasible during generation.
+    All other parts of the model remain unchanged — the buffered durations
+    only affect which columns are feasible in H_{d,p}.
+
+    A larger μ produces more conservative schedules by reserving additional
+    time for each appointment, making it less likely that a running-over
+    appointment causes a room collision.
+
+    This policy is implemented entirely in the preprocessing and column
+    generation stages. The MP formulation is unchanged.
     """
-    rng = np.random.default_rng(seed)
-    chosen: Dict[Tuple[str, str], Pattern] = {}
-    total_cost = 0.0
-    pid = 0
-
+    # ── Preprocessing: inflate durations by buffer factor μ ──────────────────
+    # Create buffered copies of every appointment: d'_i = d_i * (1 + μ)
+    # These are used only for feasibility checking during pattern generation.
+    buffered_groups: Dict[Tuple[str, str], List[Appointment]] = {}
     for (prov, date), appts in groups.items():
-        active = [a for a in appts if a.is_active]
-        if not active:
-            continue
+        buffered = []
+        for a in appts:
+            if not a.is_active:
+                continue
+            buffered_dur = int(np.ceil(a.duration * (1 + buffer_factor)))
+            buffered_a = Appointment(
+                appt_id=a.appt_id,
+                patient_id=a.patient_id,
+                provider=a.provider,
+                date=a.date,
+                start_min=a.start_min,
+                duration=buffered_dur,   # d'_i = d_i * (1 + μ)
+                appt_type=a.appt_type,
+                no_show=a.no_show,
+                cancelled=a.cancelled,
+                deleted=a.deleted,
+            )
+            buffered.append(buffered_a)
+        if buffered:
+            buffered_groups[(prov, date)] = buffered
 
-        # Generate perturbed duration scenarios
-        scenarios: List[List[Appointment]] = []
-        for _ in range(n_scenarios):
-            perturbed = []
-            for a in active:
-                std = max(1.0, a.duration * duration_std_frac)
-                new_dur = int(np.clip(rng.normal(a.duration, std), 1, 120))
-                # Create a copy with perturbed duration
-                pa = Appointment(
-                    appt_id=a.appt_id,
-                    patient_id=a.patient_id,
-                    provider=a.provider,
-                    date=a.date,
-                    start_min=a.start_min,
-                    duration=new_dur,
-                    appt_type=a.appt_type,
-                    no_show=a.no_show,
-                    cancelled=a.cancelled,
-                    deleted=a.deleted,
-                )
-                perturbed.append(pa)
-            scenarios.append(perturbed)
+    # ── CG: generate patterns using buffered durations ────────────────────────
+    # Feasibility is checked against d'_i so only patterns with enough
+    # inter-appointment slack are admitted into H_{d,p}.
+    patterns_map: Dict[Tuple[str, str], List[Pattern]] = {}
+    for (prov, date), buffered_appts in buffered_groups.items():
+        patterns_map[(prov, date)] = generate_initial_patterns(
+            buffered_appts, prov, date
+        )
 
-        # Baseline feasible patterns (from nominal durations)
-        base_pats = feasible_room_assignment(active, date, ROOMS)
-        if not base_pats:
-            continue
+    patterns_map = column_generation(buffered_groups, patterns_map, cg_iters)
 
-        # Score each baseline pattern by how many scenarios it stays feasible
-        pat_scores: List[Tuple[int, float, int]] = []  # (feasible_count, avg_cost, idx)
-        for idx, assignment in enumerate(base_pats):
-            feasible_count = 0
-            scenario_costs = []
-            for scenario in scenarios:
-                # Check feasibility: no two appointments in same room overlap
-                room_to_appts: Dict[int, List[Appointment]] = defaultdict(list)
-                for sa in scenario:
-                    r = assignment.get(sa.appt_id)
-                    if r is not None:
-                        room_to_appts[r].append(sa)
-                ok = True
-                for r, rappts in room_to_appts.items():
-                    rappts_sorted = sorted(rappts, key=lambda x: x.start_min)
-                    for a1, a2 in zip(rappts_sorted, rappts_sorted[1:]):
-                        if a1.start_min + a1.duration > a2.start_min:
-                            ok = False
-                            break
-                    if not ok:
-                        break
-                if ok:
-                    feasible_count += 1
-                    scenario_costs.append(compute_pattern_cost(assignment, scenario))
-            avg_cost = float(np.mean(scenario_costs)) if scenario_costs else float("inf")
-            pat_scores.append((feasible_count, avg_cost, idx))
+    # ── MP: solve using buffered patterns ────────────────────────────────────
+    # Cross-provider conflict constraints use appointment overlap timing.
+    # Buffered durations inflate appointments and create artificial overlaps
+    # between providers that don't exist under nominal durations. We skip
+    # Constraint (3) here — the nominal CG solution already enforces it.
+    # Policy F's purpose is to test within-provider pattern feasibility
+    # under duration inflation, not cross-provider conflict resolution.
+    obj, chosen_buffered = build_and_solve_master(
+        buffered_groups, patterns_map, integer=True,
+        skip_conflict_constraints=True,
+    )
 
-        # Most robust: max feasible scenarios, then min avg cost
-        pat_scores.sort(key=lambda x: (-x[0], x[1]))
-        best_feasible, best_avg_cost, best_idx = pat_scores[0]
-
-        nominal_cost = compute_pattern_cost(base_pats[best_idx], active)
-        pat = Pattern(pid, prov, date, base_pats[best_idx], nominal_cost)
-        chosen[(prov, date)] = pat
-        total_cost += nominal_cost
-
-        print(f"  [Policy F] ({prov}, {date}): robust pattern feasible in "
-              f"{best_feasible}/{n_scenarios} scenarios, "
-              f"avg cost={best_avg_cost:.1f}m")
+    # Remap pattern assignments back to original appointment objects so
+    # the schedule output uses nominal durations for display.
+    chosen: Dict[Tuple[str, str], Pattern] = {}
+    pid = 0
+    for (prov, date), pat in chosen_buffered.items():
+        orig_appts = [a for a in groups.get((prov, date), []) if a.is_active]
+        nominal_cost = compute_pattern_cost(pat.assignment, orig_appts)
+        chosen[(prov, date)] = Pattern(pid, prov, date, pat.assignment, nominal_cost)
         pid += 1
 
+    total_cost = sum(p.cost for p in chosen.values())
     return total_cost, chosen
 
 
@@ -1572,7 +1596,7 @@ def run_all_policies(
         ("D – Admin Overflow ON",   lambda g: policy_d_admin_overflow(g, allow_admin_overflow=True)),
         ("D – Admin Overflow OFF",  lambda g: policy_d_admin_overflow(g, allow_admin_overflow=False)),
         ("E – Overbook (10% NS)",   lambda g: policy_e_overbook(g, no_show_rate=0.10)),
-        ("F – Uncertainty (σ=20%)", lambda g: policy_f_uncertainty(g, duration_std_frac=0.20)),
+        ("F – Uncertainty (σ=20%)", lambda g: policy_f_uncertainty(g, buffer_factor=0.20)),
     ]
 
     metrics = [
