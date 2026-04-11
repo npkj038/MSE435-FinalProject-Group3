@@ -3,3 +3,9 @@ __pycache__/
 .venv/
 venv/
 data/
+/export_schedule_excel1.py
+/export_schedule_excel2.py
+/hospital_room_scheduler1.py
+/hospital_room_scheduler2.py
+/schedule_output_W1_2.xlsx
+/schedule_output_W2_2.xlsx

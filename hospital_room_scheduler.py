@@ -1,12 +1,15 @@
 """
 MSE 435 – Examination Room Scheduling via Column Generation
 ===========================================================
-Implements:
-  • Data loading from the project CSV
-  • Pricing sub-problem  (enumerate feasible patterns per provider per day)
-  • Master Problem (MP)  (set-cover / set-partition LP solved via scipy.optimize.milp)
-  • Integer solution recovery (branch-and-bound via scipy MILP)
-  • KPI reporting and Gantt-style schedule printing
+Blocked time windows are SOFT constraints with a per-minute penalty.
+Appointments overlapping admin/lunch blocks are still schedulable,
+but incur a penalty (ADMIN_PENALTY_PER_MIN) added to the pattern cost.
+
+New KPI: Room Utilization
+  - room_utilization_pct: percentage of available room-minutes actually used
+  - rooms_used_count: number of distinct rooms used across all chosen patterns
+  - avg_appts_per_room_used: average appointments per room that was used
+  - room_utilization_by_room: per-room breakdown (printed separately)
 
 Run:
     python hospital_room_scheduler.py --csv AppointmentDataWeek1.csv [--day 11-10-2025]
@@ -14,9 +17,8 @@ Run:
 
 import argparse
 import csv
-import itertools
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -26,8 +28,6 @@ from scipy.optimize import milp, LinearConstraint, Bounds
 # 0.  PROBLEM CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Rectilinear distance table (ER1 … ER16).  Upper-triangle supplied by PDF.
-# We fill the full symmetric matrix here.
 _RAW_DISTANCES: Dict[Tuple[int, int], float] = {
     (1, 2): 0.5, (1, 3): 1.5, (1, 4): 2.5, (1, 5): 4.0, (1, 6): 4.7,
     (1, 7): 2.0, (1, 8): 3.0, (1, 9): 4.7, (1, 10): 4.1, (1, 11): 3.3,
@@ -64,52 +64,86 @@ _RAW_DISTANCES: Dict[Tuple[int, int], float] = {
 NUM_ROOMS = 16
 ROOMS: List[int] = list(range(1, NUM_ROOMS + 1))
 
+# ── Soft-constraint penalty ───────────────────────────────────────────────────
+# Cost added per minute an appointment overlaps a blocked admin/lunch window.
+# Set higher to more strongly discourage scheduling into blocked slots.
+ADMIN_PENALTY_PER_MIN: float = 2.0
+
+# ── Operating day window for room-utilization denominator ─────────────────────
+# A room is "available" from DAY_START_MIN to DAY_END_MIN each day it appears
+# in the schedule.  Blocked admin/lunch windows are subtracted so the
+# denominator reflects only clinically schedulable time.
+DAY_START_MIN: int = 8 * 60   # 08:00
+DAY_END_MIN:   int = 17 * 60  # 17:00
+
+
 def room_distance(r1: int, r2: int) -> float:
-    """Return rectilinear distance between rooms r1 and r2 (1-indexed)."""
     if r1 == r2:
         return 0.0
     key = (min(r1, r2), max(r1, r2))
     return _RAW_DISTANCES.get(key, 0.0)
 
-# Operating time windows (minutes from midnight)
-# Mon–Thu: admin 9:00–9:30, noon-admin 11:30–12:00, lunch 12:00–13:00, admin 16:30–17:00
-# Fri:     admin 8:00–8:30,  noon-admin 11:30–12:00, lunch 12:00–13:00, admin 15:00–15:30
+
 BLOCKED_MON_THU = [
-    (9 * 60,      9 * 60 + 30),   # morning admin
-    (11 * 60 + 30, 12 * 60),      # noon admin
-    (12 * 60,     13 * 60),       # lunch
-    (16 * 60 + 30, 17 * 60),      # afternoon admin
+    (9 * 60,       9 * 60 + 30),
+    (11 * 60 + 30, 12 * 60),
+    (12 * 60,      13 * 60),
+    (16 * 60 + 30, 17 * 60),
 ]
 BLOCKED_FRI = [
-    (8 * 60,       8 * 60 + 30),  # morning admin
-    (11 * 60 + 30, 12 * 60),      # noon admin
-    (12 * 60,      13 * 60),      # lunch
-    (15 * 60,      15 * 60 + 30), # afternoon admin
+    (8 * 60,       8 * 60 + 30),
+    (11 * 60 + 30, 12 * 60),
+    (12 * 60,      13 * 60),
+    (15 * 60,      15 * 60 + 30),
 ]
 
+
 def is_friday(date_str: str) -> bool:
-    """Determine if a date string (MM-DD-YYYY) is a Friday."""
     from datetime import datetime
     try:
         dt = datetime.strptime(date_str, "%m-%d-%Y")
-        return dt.weekday() == 4  # 0=Mon … 4=Fri
+        return dt.weekday() == 4
     except ValueError:
         return False
+
 
 def blocked_windows(date_str: str) -> List[Tuple[int, int]]:
     return BLOCKED_FRI if is_friday(date_str) else BLOCKED_MON_THU
 
+
 def time_str_to_minutes(t: str) -> int:
-    """Convert 'HH:MM:SS' or 'HH:MM' to integer minutes from midnight."""
     parts = t.strip().split(":")
     return int(parts[0]) * 60 + int(parts[1])
 
-def is_available(start_min: int, end_min: int, blocks: List[Tuple[int, int]]) -> bool:
-    """Return True if [start, end) does not overlap any blocked window."""
+
+def is_available(start_min: int, end_min: int,
+                 blocks: List[Tuple[int, int]]) -> bool:
+    """Used for display/reporting only — no longer gates scheduling."""
     for (bs, be) in blocks:
         if start_min < be and end_min > bs:
             return False
     return True
+
+
+def admin_overlap_minutes(start_min: int, end_min: int,
+                          blocks: List[Tuple[int, int]]) -> int:
+    """Minutes of [start_min, end_min) overlapping any blocked window."""
+    total = 0
+    for (bs, be) in blocks:
+        total += max(0, min(end_min, be) - max(start_min, bs))
+    return total
+
+
+def schedulable_minutes_per_day(date_str: str) -> int:
+    """
+    Total schedulable room-minutes in one day = (DAY_END - DAY_START)
+    minus the sum of all blocked-window durations.
+    This is the denominator used in room-utilization calculations.
+    """
+    gross = DAY_END_MIN - DAY_START_MIN
+    blocks = blocked_windows(date_str)
+    blocked = sum(be - bs for (bs, be) in blocks)
+    return max(0, gross - blocked)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -122,8 +156,8 @@ class Appointment:
     patient_id: str
     provider: str
     date: str
-    start_min: int          # minutes from midnight
-    duration: int           # minutes
+    start_min: int
+    duration: int
     appt_type: str
     no_show: bool
     cancelled: bool
@@ -145,16 +179,11 @@ class Appointment:
 
 @dataclass
 class Pattern:
-    """
-    One feasible assignment pattern h for (provider p, day d).
-    assignment: dict mapping appt_id -> room_number
-    cost:       total travel distance (metres) induced by this pattern
-    """
     pattern_id: int
     provider: str
     date: str
     assignment: Dict[int, int]   # appt_id -> room
-    cost: float
+    cost: float                  # travel distance + admin penalty
 
     def covers(self, appt_id: int) -> bool:
         return appt_id in self.assignment
@@ -169,13 +198,12 @@ def load_appointments(csv_path: str) -> List[Appointment]:
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for idx, row in enumerate(reader):
-            # Strip whitespace from keys and values
             row = {k.strip(): (v.strip() if isinstance(v, str) else v)
                    for k, v in row.items()}
             duration_raw = row.get("Appt Duration", "0") or "0"
             duration = int(float(duration_raw)) if duration_raw else 0
             if duration <= 0:
-                continue  # skip 0-duration rows
+                continue
 
             time_raw = row.get("Appt Time", "09:00:00") or "09:00:00"
             try:
@@ -200,51 +228,51 @@ def load_appointments(csv_path: str) -> List[Appointment]:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3.  PRICING SUB-PROBLEM
-#     Enumerate all feasible assignment patterns for one (provider, day) group.
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_K_dp(appts: List[Appointment], rooms: List[int]) -> List[Tuple[int, int]]:
-    """
-    K_{d,p} = {(r, i) : r ∈ R, i ∈ A_{d,p}}
-    Returns the full set of room-appointment combinations for a provider-day.
-    """
-    return [(r, a.appt_id) for r in rooms for a in appts]
-
-
 def compute_Pi_dp(appts: List[Appointment]) -> List[Tuple[int, int]]:
-    """
-    Π_{d,p} = {(i, i') : i, i' ∈ A_{d,p}, i is immediately before i'
-               in provider p's schedule on day d}
-    Appointments are sorted by start time; consecutive pairs form Π.
-    Note: per Image 2, appointments within a provider are non-overlapping,
-    so the consecutive ordering is well-defined.
-    """
     sorted_appts = sorted(appts, key=lambda a: a.start_min)
-    return [(sorted_appts[k].appt_id, sorted_appts[k+1].appt_id)
+    return [(sorted_appts[k].appt_id, sorted_appts[k + 1].appt_id)
             for k in range(len(sorted_appts) - 1)]
 
 
-def compute_pattern_cost(assignment: Dict[int, int],
-                          appts: List[Appointment]) -> float:
+def compute_pattern_cost(
+    assignment: Dict[int, int],
+    appts: List[Appointment],
+    date: Optional[str] = None,
+    penalty_per_min: float = ADMIN_PENALTY_PER_MIN,
+) -> float:
     """
-    cost^h_{d,p} = Σ_{(i,i') ∈ Π_{d,p}} c_{r^h_i, r^h_{i'}}
+    Pattern cost = travel distance  +  admin-overlap penalty.
 
-    where r^h_i is the room assigned to appointment i in pattern h,
-    and Π_{d,p} is the set of consecutive appointment pairs (Image 3).
-    c_{r,r'} is the rectilinear distance between rooms r and r'.
+    Travel distance: Σ_{(i,i') ∈ Π_{d,p}} c_{r^h_i, r^h_{i'}}
+    Admin penalty:   Σ_{i ∈ A_{d,p}} penalty_per_min × τ_i
+      where τ_i = minutes of appointment i overlapping a blocked window.
+
+    When date=None the penalty term is skipped (backwards-compatible).
     """
     pi_dp = compute_Pi_dp(appts)
-    cost = 0.0
+    travel = 0.0
     for (i, i_prime) in pi_dp:
         r_i      = assignment.get(i)
         r_iprime = assignment.get(i_prime)
         if r_i is not None and r_iprime is not None:
-            cost += room_distance(r_i, r_iprime)
-    return cost
+            travel += room_distance(r_i, r_iprime)
+
+    penalty = 0.0
+    if date is not None and penalty_per_min > 0:
+        blocks = blocked_windows(date)
+        appt_map = {a.appt_id: a for a in appts}
+        for aid in assignment:
+            a = appt_map.get(aid)
+            if a is not None:
+                overlap = admin_overlap_minutes(a.start_min, a.end_min, blocks)
+                penalty += penalty_per_min * overlap
+
+    return travel + penalty
 
 
 def appointments_overlap(a1: Appointment, a2: Appointment) -> bool:
-    """True if two appointments overlap in time."""
     return a1.start_min < a2.end_min and a2.start_min < a1.end_min
 
 
@@ -255,134 +283,94 @@ def solve_pricing_subproblem(
     duals_coverage: Dict[int, float],
     dual_assignment: float,
     single_room: bool = False,
+    penalty_per_min: float = ADMIN_PENALTY_PER_MIN,
 ) -> Optional[Tuple[Dict[int, int], float]]:
     """
-    Pricing sub-problem (column generation oracle).
-
-    single_room=True enforces the Policy A day-variant column feasibility
-    constraint: the pricing oracle only considers patterns where all
-    appointments are assigned to the same room r.  The search reduces to
-    finding the single room r that minimises the reduced cost, which is
-    simply: RC(r) = 0 - total_dual  (travel cost is always 0 for single-room).
+    Pricing sub-problem — blocked windows are soft constraints.
+    All active appointments are eligible; scheduling into a blocked window
+    incurs penalty_per_min × overlap_minutes added to the reduced cost.
     """
     blocks = blocked_windows(date)
 
-    # Only schedule appointments that fall outside hard-blocked windows
-    valid_appts = sorted(
-        [a for a in appts if is_available(a.start_min, a.end_min, blocks)],
-        key=lambda a: a.start_min,
-    )
+    # ALL active appointments are eligible — no hard filter
+    valid_appts = sorted(appts, key=lambda a: a.start_min)
     if not valid_appts:
         return None
 
     n = len(valid_appts)
 
-    # Dual contribution that every complete pattern earns just by existing:
-    # Σ_k μ_k  +  λ_{dp}
-    total_dual = sum(duals_coverage.get(a.appt_id, 0.0) for a in valid_appts) \
-                 + dual_assignment
+    appt_penalty = {
+        a.appt_id: penalty_per_min * admin_overlap_minutes(
+            a.start_min, a.end_min, blocks)
+        for a in valid_appts
+    }
 
-    # ── Policy A day-variant fast path ───────────────────────────────────────
-    # When single_room=True the column feasibility constraint restricts H_{d,p}
-    # to patterns where every appointment is in the same room r.
-    # Travel cost is always 0 for such patterns (no room switches).
-    # RC(r) = 0 - total_dual  for any feasible single room r.
-    # We just need to find one room where all appointments fit (no overlaps).
+    total_dual = (
+        sum(duals_coverage.get(a.appt_id, 0.0) for a in valid_appts)
+        + dual_assignment
+    )
+
+    # ── Policy A fast path (single_room=True) ────────────────────────────────
     if single_room:
-        # Check if appointments are mutually non-overlapping (required for
-        # single-room feasibility — two overlapping appointments cannot share
-        # a room simultaneously).
-        feasible_single = True
         occupied_until = 0
+        feasible_single = True
         for a in valid_appts:
             if a.start_min < occupied_until:
                 feasible_single = False
                 break
             occupied_until = a.end_min
-
         if not feasible_single:
-            return None  # no single-room pattern exists
+            return None
 
-        # All rooms are equally good (RC = 0 - total_dual); return room 1
-        rc = 0.0 - total_dual
+        single_cost = sum(appt_penalty[a.appt_id] for a in valid_appts)
+        rc = single_cost - total_dual
         assignment = {a.appt_id: rooms[0] for a in valid_appts}
         return assignment, rc
 
-    # Best reduced cost found so far (we want the most negative)
-    best_rc: List[float] = [float("inf")]
-    best_assignment: List[Optional[Dict[int, int]]] = [None]
+    # ── Beam search (replaces exponential backtracking) ───────────────────────
+    # State: (partial_cost, last_room, last_end, room_end_times, assignment)
+    # We keep the BEAM_WIDTH cheapest partial states at each appointment step.
+    BEAM_WIDTH = 8
 
-    def backtrack(
-        idx: int,
-        current: Dict[int, int],
-        room_end_times: Dict[int, int],   # room -> earliest free minute
-        partial_travel: float,
-        last_room: Optional[int],
-        last_end: int,
-    ) -> None:
-        """
-        idx:           index into valid_appts being assigned next
-        current:       partial assignment so far {appt_id: room}
-        room_end_times: when each room becomes free
-        partial_travel: travel cost accumulated so far
-        last_room:     room used by the immediately preceding appointment
-        last_end:      end time of the immediately preceding appointment
-        """
-        if idx == n:
-            # Complete pattern — compute reduced cost
-            rc = partial_travel - total_dual
-            if rc < best_rc[0]:
-                best_rc[0] = rc
-                best_assignment[0] = dict(current)
-            return
+    # Initial state
+    beam = [(0.0, None, 0, {}, {})]  # (cost, last_room, last_end, room_end_times, assignment)
 
-        a = valid_appts[idx]
+    for a in valid_appts:
+        pen = appt_penalty[a.appt_id]
+        candidates = []
 
-        for r in rooms:
-            # Room conflict check: room must be free at appointment start
-            if room_end_times.get(r, 0) > a.start_min:
-                continue
+        for (partial_cost, last_room, last_end, room_end_times, assignment) in beam:
+            for r in rooms:
+                if room_end_times.get(r, 0) > a.start_min:
+                    continue  # room occupied
 
-            # Travel cost increment: distance from last room to this room
-            # (only applies if this appointment immediately follows another
-            #  in time; we track the previous appointment's room regardless
-            #  of which room it was, since the provider walks between them)
-            if last_room is not None and a.start_min >= last_end:
-                travel_inc = room_distance(last_room, r)
-            else:
                 travel_inc = 0.0
+                if last_room is not None and a.start_min >= last_end:
+                    travel_inc = room_distance(last_room, r)
 
-            new_travel = partial_travel + travel_inc
+                new_cost = partial_cost + travel_inc + pen
 
-            # Pruning: even if all remaining appointments have zero travel,
-            # can we beat the current best?
-            # Lower bound on RC for this branch = new_travel - total_dual
-            # (remaining duals already subtracted in total_dual)
-            if new_travel - total_dual >= best_rc[0]:
-                continue  # prune
+                new_room_end_times = dict(room_end_times)
+                new_room_end_times[r] = a.end_min
+                new_assignment = dict(assignment)
+                new_assignment[a.appt_id] = r
 
-            # Assign
-            prev_end = room_end_times.get(r, 0)
-            current[a.appt_id] = r
-            room_end_times[r] = a.end_min
+                candidates.append((new_cost, r, a.end_min,
+                                   new_room_end_times, new_assignment))
 
-            backtrack(
-                idx + 1, current, room_end_times,
-                new_travel, r, a.end_min,
-            )
+        if not candidates:
+            return None  # no feasible extension
 
-            # Un-assign
-            del current[a.appt_id]
-            if prev_end == 0:
-                del room_end_times[r]
-            else:
-                room_end_times[r] = prev_end
+        # Keep best BEAM_WIDTH by partial cost
+        candidates.sort(key=lambda x: x[0])
+        beam = candidates[:BEAM_WIDTH]
 
-    backtrack(0, {}, {}, 0.0, None, 0)
-
-    if best_assignment[0] is None:
+    if not beam:
         return None
-    return best_assignment[0], best_rc[0]
+
+    best_cost, _, _, _, best_assignment = beam[0]
+    best_rc = best_cost - total_dual
+    return best_assignment, best_rc
 
 
 def _greedy_pattern(
@@ -391,14 +379,10 @@ def _greedy_pattern(
     start_room: int,
     preferred_room: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
+    date: Optional[str] = None,
+    penalty_per_min: float = ADMIN_PENALTY_PER_MIN,
 ) -> Optional[Dict[int, int]]:
-    """
-    Build one greedy feasible pattern by processing appointments in
-    chronological order.  At each step, pick the available room that
-    minimises travel from the previous room, with optional preference
-    for `preferred_room` and optional random tie-breaking via `rng`.
-    Returns None if no feasible assignment exists.
-    """
+    blocks = blocked_windows(date) if date else []
     assignment: Dict[int, int] = {}
     room_end_times: Dict[int, int] = {}
     last_r = start_room
@@ -408,10 +392,11 @@ def _greedy_pattern(
         if not free_rooms:
             return None
 
-        # Sort by: (not preferred, distance from last_r, optional jitter)
+        pen = penalty_per_min * admin_overlap_minutes(a.start_min, a.end_min, blocks)
+
         def key(r: int) -> Tuple:
             jitter = float(rng.random()) * 0.01 if rng is not None else 0.0
-            return (r != preferred_room, room_distance(last_r, r) + jitter)
+            return (r != preferred_room, room_distance(last_r, r) + pen + jitter)
 
         chosen_r = min(free_rooms, key=key)
         assignment[a.appt_id] = chosen_r
@@ -429,34 +414,13 @@ def generate_initial_patterns(
     n_initial: int = 50,
     seed: int = 0,
     single_room: bool = False,
+    penalty_per_min: float = ADMIN_PENALTY_PER_MIN,
 ) -> List[Pattern]:
     """
-    Generate a diverse set of good initial patterns for the MP.
-
-    single_room=True enforces the Policy A day-variant column feasibility
-    constraint: every appointment in pattern h must be assigned to the
-    same room r.  This restricts H_{d,p} to only single-room patterns,
-    which is equivalent to adding the feasibility rule at column generation
-    time rather than as a post-hoc assignment.
-
-    Strategy (in order, deduplicating throughout):
-      1. Single-room patterns  — one per room, zero travel, feasible only
-         when no two appointments in the schedule overlap.
-      2. Greedy nearest-room   — for each room as anchor, always pick the
-         closest free room to the previous one.  Gives low-cost patterns.
-         (skipped when single_room=True since step 1 covers all cases)
-      3. Greedy room-pinned    — for each room r, always prefer r when it
-         is free, fall back to nearest otherwise.  Diverse room usage.
-         (skipped when single_room=True)
-      4. Randomised greedy     — repeated random-jitter greedy passes to
-         fill up to n_initial distinct patterns.
-         (skipped when single_room=True)
+    Generate initial patterns.  Blocked-window appointments are NOT filtered
+    out — they are eligible columns that carry a higher cost (penalty).
     """
-    blocks = blocked_windows(date)
-    valid_appts = sorted(
-        [a for a in appts if is_available(a.start_min, a.end_min, blocks)],
-        key=lambda a: a.start_min,
-    )
+    valid_appts = sorted(appts, key=lambda a: a.start_min)
     if not valid_appts:
         return []
 
@@ -469,24 +433,19 @@ def generate_initial_patterns(
         nonlocal pid
         if assignment is None:
             return False
-        # ── Column feasibility constraint (Policy A day variant) ─────────────
-        # If single_room=True, reject any pattern that uses more than one room.
-        # This enforces: all i ∈ A_{d,p} must map to the same room r in h.
         if single_room and len(set(assignment.values())) > 1:
             return False
         sig = frozenset(assignment.items())
         if sig in seen:
             return False
         seen.add(sig)
-        cost = compute_pattern_cost(assignment, valid_appts)
+        cost = compute_pattern_cost(assignment, valid_appts,
+                                    date=date, penalty_per_min=penalty_per_min)
         patterns.append(Pattern(pid, provider, date, dict(assignment), cost))
         pid += 1
         return True
 
-    # ── 1. Single-room patterns (zero travel) ────────────────────────────────
-    # These are the ONLY feasible patterns when single_room=True.
-    # One pattern per room r: all appointments assigned to r.
-    # Feasible only when no two appointments in the schedule overlap in time.
+    # 1. Single-room patterns (zero travel)
     for r in rooms:
         occupied_until = 0
         ok = True
@@ -498,39 +457,38 @@ def generate_initial_patterns(
         if ok:
             add({a.appt_id: r for a in valid_appts})
 
-    # Steps 2–4 only run when single_room=False (multi-room patterns allowed)
     if not single_room:
-        # ── 2. Greedy nearest-room (one per anchor room) ─────────────────────
+        # 2. Greedy nearest-room
         for start_room in rooms:
-            add(_greedy_pattern(valid_appts, rooms, start_room))
+            add(_greedy_pattern(valid_appts, rooms, start_room,
+                                date=date, penalty_per_min=penalty_per_min))
 
-        # ── 3. Greedy room-pinned (prefer room r, fall back when busy) ───────
+        # 3. Greedy room-pinned
         for preferred in rooms:
             add(_greedy_pattern(valid_appts, rooms,
-                                start_room=preferred, preferred_room=preferred))
+                                start_room=preferred, preferred_room=preferred,
+                                date=date, penalty_per_min=penalty_per_min))
 
-        # ── 4. Randomised greedy to reach n_initial distinct patterns ─────────
+        # 4. Randomised greedy
         attempts = 0
         while len(patterns) < n_initial and attempts < n_initial * 10:
             attempts += 1
             start_room = int(rng.choice(rooms))
             preferred  = int(rng.choice(rooms))
             add(_greedy_pattern(valid_appts, rooms, start_room,
-                                preferred_room=preferred, rng=rng))
+                                preferred_room=preferred, rng=rng,
+                                date=date, penalty_per_min=penalty_per_min))
 
     return patterns
 
 
-def generate_patterns(appts: List[Appointment],
-                       provider: str,
-                       date: str,
-                       rooms: List[int] = ROOMS,
-                       single_room: bool = False) -> List[Pattern]:
-    """
-    Wrapper used for initial pattern generation.
-    single_room=True enforces the Policy A day-variant column feasibility
-    constraint throughout the CG pipeline.
-    """
+def generate_patterns(
+    appts: List[Appointment],
+    provider: str,
+    date: str,
+    rooms: List[int] = ROOMS,
+    single_room: bool = False,
+) -> List[Pattern]:
     return generate_initial_patterns(appts, provider, date, rooms,
                                      single_room=single_room)
 
@@ -541,16 +499,8 @@ def feasible_room_assignment(
     rooms: List[int],
     n_patterns: int = 50,
 ) -> List[Dict[int, int]]:
-    """
-    Return a list of feasible raw assignment dicts (appt_id -> room).
-    Used by the policy functions.  Generates up to n_patterns good patterns
-    via the greedy nearest-room strategy rather than full enumeration.
-    """
-    blocks = blocked_windows(date)
-    valid_appts = sorted(
-        [a for a in appts if is_available(a.start_min, a.end_min, blocks)],
-        key=lambda a: a.start_min,
-    )
+    """Return feasible raw assignment dicts.  All active appointments eligible."""
+    valid_appts = sorted(appts, key=lambda a: a.start_min)
     if not valid_appts:
         return []
 
@@ -568,7 +518,6 @@ def feasible_room_assignment(
             last_r = start_room
             feasible = True
             for a in valid_appts:
-                # prefer secondary room for variety; fall back to nearest free
                 ordered = sorted(
                     [r for r in rooms if room_end_times.get(r, 0) <= a.start_min],
                     key=lambda r: (r != secondary, room_distance(last_r, r)),
@@ -591,195 +540,97 @@ def feasible_room_assignment(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4.  MASTER PROBLEM (MP)
-#     min  Σ_{d,p,h} cost^h_{dp} · α^h_{dp}
-#     s.t. Σ_h a^h_{dp,k} · α^h_{dp} = 1  ∀k∈K_p, ∀p, ∀d   (coverage)
-#          Σ_h α^h_{dp}             = 1  ∀p, ∀d               (one pattern)
-#          α^h_{dp} ∈ {0,1}
 # ──────────────────────────────────────────────────────────────────────────────
 
 def print_cg_matrices(
-    var_index: List[Tuple[str, str, int]],
-    patterns_map: Dict[Tuple[str, str], List[Pattern]],
-    c: np.ndarray,
-    A: np.ndarray,
-    lb: np.ndarray,
-    ub: np.ndarray,
-    x: Optional[np.ndarray],
-    constraint_labels: List[str],
-    iteration_label: str,
-    max_cols_display: int = 30,
+    var_index, patterns_map, c, A, lb, ub, x,
+    constraint_labels, iteration_label, max_cols_display=30,
 ) -> None:
-    """
-    Print every matrix involved in one MP solve during column generation:
-
-      1. Column index table  – maps variable index j to (provider, date, pattern_id)
-      2. Objective vector c  – cost^h_{dp} for each column
-      3. Constraint matrix A – with row labels (assignment vs coverage)
-         and RHS bounds [lb, ub]
-      4. Solution vector x   – α^h_{dp} values (if solve succeeded)
-      5. Pattern detail table – room assignment for each selected pattern
-
-    When there are more columns than max_cols_display, the matrix is split
-    into blocks so it stays readable on a standard terminal.
-    """
     n_vars = len(var_index)
     n_rows = A.shape[0]
-    W = 72  # output width
+    W = 72
 
-    header = f" CG MATRICES  –  {iteration_label} "
     print("\n" + "=" * W)
-    print(header.center(W))
+    print(f" CG MATRICES  –  {iteration_label} ".center(W))
     print("=" * W)
 
-    # ── 1. Column index table ────────────────────────────────────────────────
     print(f"\n{'─'*W}")
-    print("  1. COLUMN INDEX TABLE  (one column = one pattern variable α^h_{{dp}})")
+    print("  1. COLUMN INDEX TABLE")
     print(f"{'─'*W}")
     print(f"  {'Col j':>6}  {'Provider':<10}  {'Date':<12}  {'Pat ID':>6}  "
-          f"{'cost (m)':>10}")
-    print(f"  {'------':>6}  {'--------':<10}  {'----------':<12}  {'------':>6}  "
-          f"{'--------':>10}")
+          f"{'cost':>10}")
     for j, (prov, date, pidx) in enumerate(var_index):
         pat = patterns_map[(prov, date)][pidx]
         print(f"  {j:>6}  {prov:<10}  {date:<12}  {pat.pattern_id:>6}  "
               f"{c[j]:>10.2f}")
 
-    # ── 2. Objective vector c ────────────────────────────────────────────────
     print(f"\n{'─'*W}")
-    print("  2. OBJECTIVE COST VECTOR  c  (cost^h_{{dp}} per column)")
+    print("  2. OBJECTIVE COST VECTOR  c")
     print(f"{'─'*W}")
-    # Print in rows of 10
     row_size = 10
     for start in range(0, n_vars, row_size):
         end = min(start + row_size, n_vars)
-        indices = "  " + "  ".join(f"j={j:>4}" for j in range(start, end))
-        values  = "  " + "  ".join(f"{c[j]:>6.2f}" for j in range(start, end))
-        print(indices)
-        print(values)
+        print("  " + "  ".join(f"j={j:>4}" for j in range(start, end)))
+        print("  " + "  ".join(f"{c[j]:>6.2f}" for j in range(start, end)))
         print()
 
-    # ── 3. Constraint matrix A ───────────────────────────────────────────────
     print(f"{'─'*W}")
-    print("  3. CONSTRAINT MATRIX  A  (rows = constraints, cols = pattern variables)")
-    print(f"     Shape: {n_rows} rows × {n_vars} cols    lb = ub = 1  (equality constraints)")
+    print("  3. CONSTRAINT MATRIX  A")
+    print(f"     Shape: {n_rows} rows × {n_vars} cols")
     print(f"{'─'*W}")
 
-    # Split into column blocks if too wide
-    col_blocks = list(range(0, n_vars, max_cols_display))
-    if not col_blocks:
-        col_blocks = [0]
-
+    col_blocks = list(range(0, n_vars, max_cols_display)) or [0]
     for block_start in col_blocks:
         block_end = min(block_start + max_cols_display, n_vars)
         block_cols = list(range(block_start, block_end))
-
-        # Header row: column indices
         print(f"\n  Columns j = {block_start} … {block_end - 1}")
-        hdr = f"  {'Constraint':<36} {'lb':>4} {'ub':>4}  "
-        hdr += " ".join(f"{j:>3}" for j in block_cols)
+        hdr = (f"  {'Constraint':<36} {'lb':>4} {'ub':>4}  "
+               + " ".join(f"{j:>3}" for j in block_cols))
         print(hdr)
-        print(f"  {'-'*36} {'-'*4} {'-'*4}  " +
-              " ".join("---" for _ in block_cols))
-
+        print(f"  {'-'*36} {'-'*4} {'-'*4}  "
+              + " ".join("---" for _ in block_cols))
         for r in range(n_rows):
             label = constraint_labels[r] if r < len(constraint_labels) else f"row {r}"
-            # Truncate label to fit
-            label_str = label[:36]
-            row_str = f"  {label_str:<36} {lb[r]:>4.0f} {ub[r]:>4.0f}  "
-            row_str += " ".join(
-                f"{int(A[r, j]):>3}" for j in block_cols
-            )
+            row_str = (f"  {label[:36]:<36} {lb[r]:>4.0f} {ub[r]:>4.0f}  "
+                       + " ".join(f"{int(A[r, j]):>3}" for j in block_cols))
             print(row_str)
 
-    # ── 4. Solution vector x ─────────────────────────────────────────────────
     print(f"\n{'─'*W}")
-    print("  4. SOLUTION VECTOR  x  (α^h_{{dp}} values)")
+    print("  4. SOLUTION VECTOR  x")
     print(f"{'─'*W}")
     if x is None:
-        print("  (No solution – solver did not succeed.)")
+        print("  (No solution.)")
     else:
         for start in range(0, n_vars, row_size):
             end = min(start + row_size, n_vars)
-            indices = "  " + "  ".join(f"j={j:>4}" for j in range(start, end))
-            values  = "  " + "  ".join(f"{x[j]:>6.3f}" for j in range(start, end))
-            print(indices)
-            print(values)
+            print("  " + "  ".join(f"j={j:>4}" for j in range(start, end)))
+            print("  " + "  ".join(f"{x[j]:>6.3f}" for j in range(start, end)))
             print()
-
-        # Highlight selected columns (x > 0.5 for MIP, or fractional for LP)
-        selected = [(j, var_index[j], x[j]) for j in range(n_vars) if x[j] > 1e-6]
-        print(f"  Non-zero entries ({len(selected)} of {n_vars}):")
-        print(f"  {'Col j':>6}  {'Provider':<10}  {'Date':<12}  "
-              f"{'Pat ID':>6}  {'α value':>8}")
-        print(f"  {'------':>6}  {'--------':<10}  {'----------':<12}  "
-              f"{'------':>6}  {'-------':>8}")
-        for j, (prov, date, pidx), val in selected:
-            pat = patterns_map[(prov, date)][pidx]
-            print(f"  {j:>6}  {prov:<10}  {date:<12}  "
-                  f"{pat.pattern_id:>6}  {val:>8.4f}")
-
-    # ── 5. Pattern detail for selected columns ────────────────────────────────
-    print(f"\n{'─'*W}")
-    print("  5. PATTERN DETAIL  (room assignment for each selected/non-zero column)")
-    print(f"{'─'*W}")
-    if x is None:
-        print("  (No solution available.)")
-    else:
-        selected_pats = [
-            (j, var_index[j], x[j])
-            for j in range(n_vars) if x[j] > 1e-6
-        ]
-        if not selected_pats:
-            print("  (No non-zero variables.)")
-        for j, (prov, date, pidx), val in selected_pats:
-            pat = patterns_map[(prov, date)][pidx]
-            print(f"\n  Col j={j}  {prov}  {date}  "
-                  f"Pat#{pat.pattern_id}  α={val:.4f}  cost={pat.cost:.2f}m")
-            print(f"    {'Appt ID':>8}  {'Room':>6}")
-            print(f"    {'-------':>8}  {'----':>6}")
-            for aid, room in sorted(pat.assignment.items()):
-                print(f"    {aid:>8}  ER{room:>2}")
 
     print("\n" + "=" * W + "\n")
 
 
 def compute_admin_overlap_minutes(a: Appointment, date: str) -> int:
-    """
-    τ_i — duration of appointment i that overlaps with any admin block on day d.
-    This is the overlap in minutes between [start_min, end_min) and the
-    union of all blocked windows for that day.
-    Used by Policy D's budget constraint in the MP.
-    """
-    blocks = blocked_windows(date)
-    overlap = 0
-    for (bs, be) in blocks:
-        # overlap of [a.start_min, a.end_min) with [bs, be)
-        overlap += max(0, min(a.end_min, be) - max(a.start_min, bs))
-    return overlap
+    """Legacy helper kept for Policy D compatibility."""
+    return admin_overlap_minutes(a.start_min, a.end_min, blocked_windows(date))
 
 
 def _build_mp_arrays(
-    groups: Dict[Tuple[str, str], List[Appointment]],
-    patterns_map: Dict[Tuple[str, str], List[Pattern]],
-    admin_budget: Optional[Dict[str, float]] = None,
-    skip_conflict_constraints: bool = False,
-) -> Tuple:
-    """
-    Shared helper: build all numpy arrays for the MP formulation.
-    Returns (n_vars, var_index, A, lb, ub, c, group_var_indices, constraint_labels).
-    Used by both build_and_solve_master and the dual extraction step in CG.
-
-    admin_budget: optional dict {date: B_d} — if provided, adds Constraint (4):
-        Σ_{p,h,i} a^h_{d,p,(r,i)} · α^h_{d,p} · τ_i ≤ B_d  ∀d∈D
-    where τ_i = minutes of appointment i overlapping an admin block on day d.
-    """
+    groups,
+    patterns_map,
+    admin_budget=None,
+    skip_conflict_constraints=False,
+):
     var_index: List[Tuple[str, str, int]] = []
     for (prov, date), pats in patterns_map.items():
         for j in range(len(pats)):
             var_index.append((prov, date, j))
 
     n_vars = len(var_index)
-    c = np.array([patterns_map[(v[0], v[1])][v[2]].cost for v in var_index], dtype=float)
+    c = np.array(
+        [patterns_map[(v[0], v[1])][v[2]].cost for v in var_index],
+        dtype=float,
+    )
 
     rows_A: List[np.ndarray] = []
     lb_list: List[float] = []
@@ -790,7 +641,7 @@ def _build_mp_arrays(
     for vi, (prov, date, pidx) in enumerate(var_index):
         group_var_indices[(prov, date)].append(vi)
 
-    # Constraint (1): Coverage — each appointment covered by exactly one pattern
+    # Constraint (1): Coverage — each active appointment covered exactly once
     all_appt_ids: Dict[Tuple[str, str], List[int]] = {}
     for (prov, date), appts in groups.items():
         ids = [a.appt_id for a in appts if a.is_active]
@@ -807,18 +658,22 @@ def _build_mp_arrays(
                 if _p == prov and _d == date and pats[pidx].covers(aid):
                     row[vi] = 1.0
             if row.sum() > 0:
-                rows_A.append(row); lb_list.append(1.0); ub_list.append(1.0)
+                rows_A.append(row)
+                lb_list.append(1.0)
+                ub_list.append(1.0)
                 constraint_labels.append(f"(1)COVER appt#{aid} {prov} {date}")
 
-    # Constraint (2): Assignment — exactly one pattern per provider-day
+    # Constraint (2): Exactly one pattern per provider-day
     for (prov, date), vindices in group_var_indices.items():
         row = np.zeros(n_vars)
         for vi in vindices:
             row[vi] = 1.0
-        rows_A.append(row); lb_list.append(1.0); ub_list.append(1.0)
+        rows_A.append(row)
+        lb_list.append(1.0)
+        ub_list.append(1.0)
         constraint_labels.append(f"(2)ASSIGN {prov} {date}")
 
-    # Constraint (3): Cross-provider room conflict (skipped when skip_conflict_constraints=True)
+    # Constraint (3): Cross-provider room conflict
     if not skip_conflict_constraints:
         date_provider_appts: Dict[str, Dict[str, List[Appointment]]] = defaultdict(dict)
         for (prov, date), appts in groups.items():
@@ -854,30 +709,27 @@ def _build_mp_arrays(
                                     if patterns_map[(prov_pp, date)][pidx].assignment.get(aid_pp) == r:
                                         row[vi] = 1.0
                             if row.sum() > 0:
-                                rows_A.append(row); lb_list.append(0.0); ub_list.append(1.0)
+                                rows_A.append(row)
+                                lb_list.append(0.0)
+                                ub_list.append(1.0)
                                 constraint_labels.append(
                                     f"(3)ROOM_CONFLICT r=ER{r} "
-                                    f"appt#{aid_p}({prov_p}) vs appt#{aid_pp}({prov_pp}) {date}"
+                                    f"appt#{aid_p}({prov_p}) vs "
+                                    f"appt#{aid_pp}({prov_pp}) {date}"
                                 )
 
-    # Constraint (4): Admin buffer budget (Policy D)
-    # Σ_{p∈P} Σ_{h∈H_{d,p}} Σ_{i∈A_{d,p}} a^h_{d,p,(r,i)} · α^h_{d,p} · τ_i ≤ B_d
-    # ∀d∈D
-    # τ_i = minutes of appointment i overlapping an admin block on day d.
-    # One constraint row per day. Only added when admin_budget is provided.
+    # Constraint (4): Admin budget (Policy D) — enforced per provider-day
     if admin_budget:
-        all_dates = sorted({date for (_, date) in groups})
-        for date in all_dates:
-            B_d = admin_budget.get(date)
+        for (prov, date), vindices in group_var_indices.items():
+            B_d = admin_budget.get((prov, date))
             if B_d is None:
                 continue
             row = np.zeros(n_vars)
-            for vi, (prov, d, pidx) in enumerate(var_index):
-                if d != date:
-                    continue
-                pat = patterns_map[(prov, date)][pidx]
-                appts = groups.get((prov, date), [])
-                for a in appts:
+            for vi in vindices:
+                pidx = var_index[vi][2]
+                pat  = patterns_map[(prov, date)][pidx]
+                appts_pd = groups.get((prov, date), [])
+                for a in appts_pd:
                     if not a.is_active:
                         continue
                     if pat.covers(a.appt_id):
@@ -887,7 +739,8 @@ def _build_mp_arrays(
                 rows_A.append(row)
                 lb_list.append(0.0)
                 ub_list.append(float(B_d))
-                constraint_labels.append(f"(4)ADMIN_BUDGET B={B_d}min {date}")
+                constraint_labels.append(
+                    f"(4)ADMIN_BUDGET {prov} B={B_d}min {date}")
 
     A  = np.array(rows_A)
     lb = np.array(lb_list)
@@ -896,38 +749,35 @@ def _build_mp_arrays(
 
 
 def build_and_solve_master(
-    groups: Dict[Tuple[str, str], List[Appointment]],
-    patterns_map: Dict[Tuple[str, str], List[Pattern]],
-    integer: bool = True,
-    print_matrices: bool = False,
-    iteration_label: str = "MP",
-    admin_budget: Optional[Dict[str, float]] = None,
-    skip_conflict_constraints: bool = False,
-) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
+    groups,
+    patterns_map,
+    integer=True,
+    print_matrices=False,
+    iteration_label="MP",
+    admin_budget=None,
+    skip_conflict_constraints=False,
+    return_duals=False,
+) -> Tuple:
     """
-    Build the Master Problem and solve it.
+    Solve the master problem.
 
-    groups:          {(provider, date): [Appointment, ...]}
-    patterns_map:    {(provider, date): [Pattern, ...]}
-    integer:         if True solve MIP, else LP relaxation
-    print_matrices:  if True, dump every matrix to stdout
-    iteration_label: label used in matrix output headers
-
-    Returns (objective_value, selected_patterns_map)
-      selected_patterns_map: {(provider, date): chosen Pattern}
+    When return_duals=True (used by column_generation for the LP relaxation),
+    returns (obj, chosen, duals_coverage, duals_assignment, constraint_labels)
+    instead of the usual (obj, chosen).  This avoids a redundant second linprog
+    call which was causing the CG loop to hang on large instances.
     """
+    from scipy.optimize import linprog as _linprog
 
     n_vars, var_index, A, lb, ub, c, group_var_indices, constraint_labels = \
-        _build_mp_arrays(groups, patterns_map, admin_budget=admin_budget,
+        _build_mp_arrays(groups, patterns_map,
+                         admin_budget=admin_budget,
                          skip_conflict_constraints=skip_conflict_constraints)
 
     if n_vars == 0:
-        print("  [MP] No variables to optimise – returning empty solution.")
+        print("  [MP] No variables – returning empty solution.")
+        if return_duals:
+            return 0.0, {}, {}, {}, []
         return 0.0, {}
-
-    constraints = LinearConstraint(A, lb, ub)
-    bounds      = Bounds(lb=np.zeros(n_vars), ub=np.ones(n_vars))
-    integrality = np.ones(n_vars) if integer else np.zeros(n_vars)
 
     n_cov      = sum(1 for l in constraint_labels if l.startswith("(1)"))
     n_assign   = sum(1 for l in constraint_labels if l.startswith("(2)"))
@@ -935,18 +785,69 @@ def build_and_solve_master(
     print(f"  [MP] Variables: {n_vars}, Constraints: {len(constraint_labels)} "
           f"(cov:{n_cov}, assign:{n_assign}, conflict:{n_conflict})")
 
+    if return_duals:
+        # ── LP relaxation path: use linprog so we can read dual variables ──────
+        eq_mask   = (lb == ub)
+        A_eq      = A[eq_mask]
+        b_eq      = lb[eq_mask]
+        ineq_rows = A[~eq_mask]
+
+        A_ub_parts, b_ub_parts = [], []
+        if ineq_rows.shape[0] > 0:
+            A_ub_parts.append(ineq_rows)
+            b_ub_parts.append(ub[~eq_mask])
+            A_ub_parts.append(-ineq_rows)
+            b_ub_parts.append(-lb[~eq_mask])
+
+        A_ub_lp = np.vstack(A_ub_parts) if A_ub_parts else None
+        b_ub_lp = np.concatenate(b_ub_parts) if b_ub_parts else None
+
+        lp_result = _linprog(
+            c=c,
+            A_ub=A_ub_lp, b_ub=b_ub_lp,
+            A_eq=A_eq,    b_eq=b_eq,
+            bounds=[(0, 1)] * n_vars,
+            method="highs",
+        )
+
+        obj = lp_result.fun if lp_result.success else float("inf")
+
+        duals_eq   = (lp_result.eqlin.marginals
+                      if lp_result.success else np.zeros(eq_mask.sum()))
+        eq_labels  = [constraint_labels[i] for i, m in enumerate(eq_mask) if m]
+
+        duals_assignment: Dict[Tuple[str, str], float] = {}
+        duals_coverage:   Dict[int, float]             = defaultdict(float)
+
+        for dual_val, label in zip(duals_eq, eq_labels):
+            if label.startswith("(2)ASSIGN"):
+                parts = label.split()
+                if len(parts) >= 3:
+                    duals_assignment[(parts[1], parts[2])] = float(dual_val)
+            elif label.startswith("(1)COVER"):
+                parts = label.split()
+                if len(parts) >= 2:
+                    try:
+                        aid = int(parts[1].replace("appt#", ""))
+                        duals_coverage[aid] = float(dual_val)
+                    except ValueError:
+                        pass
+
+        return obj, {}, duals_coverage, duals_assignment, constraint_labels
+
+    # ── Integer (or continuous) path via milp ─────────────────────────────────
+    constraints = LinearConstraint(A, lb, ub)
+    bounds      = Bounds(lb=np.zeros(n_vars), ub=np.ones(n_vars))
+    integrality = np.ones(n_vars) if integer else np.zeros(n_vars)
+
     result = milp(c=c, constraints=constraints,
                   integrality=integrality, bounds=bounds)
 
     x = result.x if result.success else None
 
     if print_matrices:
-        print_cg_matrices(
-            var_index=var_index, patterns_map=patterns_map,
-            c=c, A=A, lb=lb, ub=ub, x=x,
-            constraint_labels=constraint_labels,
-            iteration_label=iteration_label,
-        )
+        print_cg_matrices(var_index, patterns_map, c, A, lb, ub, x,
+                          constraint_labels, iteration_label)
 
     if not result.success:
         print(f"  [MP] Solver message: {result.message}")
@@ -963,141 +864,57 @@ def build_and_solve_master(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5.  COLUMN GENERATION LOOP
-#     Iteratively:
-#       1. Solve LP relaxation of MP with current columns
-#       2. Retrieve dual variables
-#       3. Solve pricing problem per (provider, day) to find negative-RC column
-#       4. Add column if RC < 0; else stop
 # ──────────────────────────────────────────────────────────────────────────────
 
 def column_generation(
-    groups: Dict[Tuple[str, str], List[Appointment]],
-    patterns_map: Dict[Tuple[str, str], List[Pattern]],
-    max_iterations: int = 10,
-    print_matrices: bool = False,
-    single_room: bool = False,
+    groups,
+    patterns_map,
+    max_iterations=10,
+    print_matrices=False,
+    single_room=False,
+    penalty_per_min: float = ADMIN_PENALTY_PER_MIN,
 ) -> Dict[Tuple[str, str], List[Pattern]]:
-    """
-    Column generation loop.
 
-    Each iteration:
-      1. Solve the LP relaxation of the current restricted MP.
-      2. Extract dual variables μ_k (coverage) and λ_{dp} (assignment).
-      3. For each (provider, day), call the pricing oracle to find the
-         pattern with the most negative reduced cost:
-             RC = cost^h - Σ_k μ_k · a^h_k - λ_{dp}
-      4. Add any column with RC < -ε to the MP; stop when none exist.
-
-    Dual variables are approximated from the LP solution using the
-    constraint shadow prices embedded in scipy's milp result.
-    Because scipy.milp does not expose duals directly, we recover them
-    by re-solving a pure LP (integrality=0) and reading the dual from
-    the constraint residuals using the optimality conditions.
-    """
     print("\n=== Column Generation Loop ===")
-    EPSILON = 1e-6   # negative-RC threshold
+    EPSILON = 1e-6
 
     for iteration in range(1, max_iterations + 1):
         print(f"\n  Iteration {iteration}")
 
-        # ── Step 1: solve LP relaxation ──────────────────────────────────────
-        obj, chosen = build_and_solve_master(
+        # Skip conflict constraints (3) during LP relaxation — they cause
+        # exponential matrix growth (tens of thousands of rows) and make the
+        # LP solve hang.  Duals for coverage and assignment constraints are
+        # sufficient to drive the pricing sub-problem correctly.
+        obj, _, duals_coverage, duals_assignment, _ = build_and_solve_master(
             groups, patterns_map, integer=False,
             print_matrices=print_matrices,
             iteration_label=f"CG Iteration {iteration} – LP Relaxation",
+            return_duals=True,
+            skip_conflict_constraints=True,
         )
         if obj == float("inf"):
             print("  LP infeasible – stopping CG.")
             break
-        print(f"  LP objective (relaxation): {obj:.4f} m")
+        print(f"  LP objective (relaxation): {obj:.4f}")
 
-        # ── Step 2: extract true LP dual variables ───────────────────────────
-        # scipy.milp does not expose dual variables, so we re-solve the LP
-        # relaxation using scipy.optimize.linprog (which does expose duals
-        # via result.ineqlin / result.eqlin).
-        #
-        # The LP has only equality constraints (lb = ub = 1), so we pass
-        # them as A_eq / b_eq to linprog and read result.eqlin.marginals.
-        from scipy.optimize import linprog as _linprog
-
-        # Re-build A, lb, ub for the current patterns_map
-        _, _, A_lp, lb_lp, ub_lp, c_lp, vi_lp, cl_lp = _build_mp_arrays(
-            groups, patterns_map
-        )
-
-        # Split into equality (lb==ub) and inequality (lb < ub) rows
-        eq_mask = (lb_lp == ub_lp)
-        A_eq = A_lp[eq_mask];   b_eq = lb_lp[eq_mask]
-        ineq_rows = A_lp[~eq_mask]
-        # inequality: A x <= ub  and  -A x <= -lb
-        A_ub_parts, b_ub_parts = [], []
-        if ineq_rows.shape[0] > 0:
-            A_ub_parts.append(ineq_rows);  b_ub_parts.append(ub_lp[~eq_mask])
-            A_ub_parts.append(-ineq_rows); b_ub_parts.append(-lb_lp[~eq_mask])
-
-        A_ub_lp = np.vstack(A_ub_parts) if A_ub_parts else None
-        b_ub_lp = np.concatenate(b_ub_parts) if b_ub_parts else None
-
-        lp_result = _linprog(
-            c=c_lp,
-            A_ub=A_ub_lp, b_ub=b_ub_lp,
-            A_eq=A_eq,    b_eq=b_eq,
-            bounds=[(0, 1)] * len(c_lp),
-            method="highs",
-        )
-
-        # Dual variables: indexed to match equality constraint rows
-        # marginals[i] = dual of equality constraint i
-        duals_eq   = lp_result.eqlin.marginals   if lp_result.success else np.zeros(eq_mask.sum())
-        duals_ineq = lp_result.ineqlin.marginals if (lp_result.success and A_ub_lp is not None) \
-                     else np.zeros(0)
-
-        # Map duals back to constraint labels
-        # Equality constraint order matches cl_lp[eq_mask]
-        eq_labels = [cl_lp[i] for i, m in enumerate(eq_mask) if m]
-
-        duals_assignment: Dict[Tuple[str, str], float] = {}
-        duals_coverage:   Dict[int, float] = defaultdict(float)
-
-        for dual_val, label in zip(duals_eq, eq_labels):
-            if label.startswith("(2)ASSIGN"):
-                # label format: "(2)ASSIGN HPWxxx MM-DD-YYYY"
-                parts = label.split()
-                if len(parts) >= 3:
-                    prov_key = parts[1]; date_key = parts[2]
-                    duals_assignment[(prov_key, date_key)] = float(dual_val)
-            elif label.startswith("(1)COVER"):
-                # label format: "(1)COVER appt#N HPWxxx MM-DD-YYYY"
-                parts = label.split()
-                if len(parts) >= 2:
-                    try:
-                        aid = int(parts[1].replace("appt#", ""))
-                        duals_coverage[aid] = float(dual_val)
-                    except ValueError:
-                        pass
-
-        # ── Step 3: pricing sub-problem for each (provider, day) ─────────────
         new_cols_added = 0
         for (prov, date), appts in groups.items():
             active = [a for a in appts if a.is_active]
             if not active:
                 continue
 
-            result = solve_pricing_subproblem(
-                appts=active,
-                date=date,
-                rooms=ROOMS,
+            result_pricing = solve_pricing_subproblem(
+                appts=active, date=date, rooms=ROOMS,
                 duals_coverage=duals_coverage,
                 dual_assignment=duals_assignment.get((prov, date), 0.0),
                 single_room=single_room,
+                penalty_per_min=penalty_per_min,
             )
-
-            if result is None:
+            if result_pricing is None:
                 continue
 
-            assignment, rc = result
+            assignment, rc = result_pricing
 
-            # ── Step 4: add column if RC < 0 ─────────────────────────────────
             if rc < -EPSILON:
                 sig = frozenset(assignment.items())
                 existing_sigs = {
@@ -1105,13 +922,16 @@ def column_generation(
                     for p in patterns_map.get((prov, date), [])
                 }
                 if sig not in existing_sigs:
-                    cost = compute_pattern_cost(assignment, active)
+                    cost = compute_pattern_cost(
+                        assignment, active,
+                        date=date, penalty_per_min=penalty_per_min,
+                    )
                     pid = len(patterns_map.get((prov, date), []))
                     new_pat = Pattern(pid, prov, date, assignment, cost)
                     patterns_map.setdefault((prov, date), []).append(new_pat)
                     new_cols_added += 1
                     print(f"    Added column for ({prov}, {date}): "
-                          f"RC={rc:.4f}, cost={cost:.2f}m")
+                          f"RC={rc:.4f}, cost={cost:.2f}")
 
         print(f"  New columns added this iteration: {new_cols_added}")
         if new_cols_added == 0:
@@ -1122,54 +942,245 @@ def column_generation(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6.  KPI CALCULATION
+# 6.  KPI CALCULATION  (includes room-utilization metrics)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_kpis(chosen: Dict[Tuple[str, str], Pattern],
-                 groups: Dict[Tuple[str, str], List[Appointment]]) -> Dict:
-    total_travel = 0.0
-    total_room_switches = 0
-    unassigned = 0
-    providers_single_room = 0
-    provider_day_count = 0
+def compute_room_utilization(
+    chosen: Dict[Tuple[str, str], "Pattern"],
+    groups: Dict[Tuple[str, str], List[Appointment]],
+) -> Dict:
+    """
+    Room-utilization KPIs.
+
+    Methodology
+    -----------
+    For each (date, room) pair that appears in the chosen schedule we compute:
+
+        booked_minutes(date, room) =
+            Σ_{appts assigned to room on date} min(end_min, DAY_END_MIN)
+                                              - max(start_min, DAY_START_MIN)
+            clipped to [0, appointment_duration]
+
+    The denominator (available minutes) for a given room on a given day is:
+
+        available_minutes(date, room) =
+            schedulable_minutes_per_day(date)   [gross day minus blocked windows]
+
+    This is the same for every room on the same date (rooms share the same
+    operating window), so the denominator is simply:
+
+        total_available_room_minutes =
+            Σ_{distinct (date, room) pairs used} schedulable_minutes_per_day(date)
+
+    KPIs returned
+    -------------
+    room_utilization_pct         : booked / available across all used rooms (%)
+    rooms_used_count             : number of distinct rooms used
+    total_booked_room_minutes    : total appointment-minutes across all rooms
+    total_available_room_minutes : denominator (schedulable minutes × rooms used)
+    avg_appts_per_room_used      : average appointment count per room used
+    avg_booked_min_per_room      : average booked minutes per room used
+    room_utilization_by_room     : dict {room: {"booked_min", "available_min",
+                                                "utilization_pct", "appt_count"}}
+    """
+    # Accumulate booked minutes and appointment count per (date, room)
+    room_date_booked: Dict[Tuple[int, str], int] = defaultdict(int)   # (room, date) -> booked min
+    room_date_count:  Dict[Tuple[int, str], int] = defaultdict(int)   # (room, date) -> # appts
+    room_date_available: Dict[Tuple[int, str], int] = {}              # (room, date) -> avail min
+
+    for (prov, date), pat in chosen.items():
+        appts = {a.appt_id: a
+                 for a in groups.get((prov, date), [])
+                 if a.is_active}
+        sched_min = schedulable_minutes_per_day(date)
+
+        for aid, room in pat.assignment.items():
+            a = appts.get(aid)
+            if a is None:
+                continue
+            # Clip appointment to operating window
+            clipped_start = max(a.start_min, DAY_START_MIN)
+            clipped_end   = min(a.end_min,   DAY_END_MIN)
+            booked = max(0, clipped_end - clipped_start)
+
+            key = (room, date)
+            room_date_booked[key]  += booked
+            room_date_count[key]   += 1
+            room_date_available[key] = sched_min   # same for all providers on date
+
+    if not room_date_booked:
+        return {
+            "room_utilization_pct":          0.0,
+            "rooms_used_count":              0,
+            "total_booked_room_minutes":     0,
+            "total_available_room_minutes":  0,
+            "avg_appts_per_room_used":       0.0,
+            "avg_booked_min_per_room":       0.0,
+            "room_utilization_by_room":      {},
+        }
+
+    total_booked    = sum(room_date_booked.values())
+    total_available = sum(room_date_available.values())
+    n_room_days     = len(room_date_booked)
+    total_appts     = sum(room_date_count.values())
+
+    util_pct = 100.0 * total_booked / total_available if total_available > 0 else 0.0
+
+    # Per-room rollup (summed across all dates that room appears)
+    room_booked:    Dict[int, int] = defaultdict(int)
+    room_available: Dict[int, int] = defaultdict(int)
+    room_appts:     Dict[int, int] = defaultdict(int)
+
+    for (room, date), bmin in room_date_booked.items():
+        room_booked[room]    += bmin
+        room_available[room] += room_date_available[(room, date)]
+        room_appts[room]     += room_date_count[(room, date)]
+
+    room_util_by_room: Dict[int, Dict] = {}
+    for room in sorted(room_booked.keys()):
+        avail = room_available[room]
+        booked = room_booked[room]
+        room_util_by_room[room] = {
+            "booked_min":      booked,
+            "available_min":   avail,
+            "utilization_pct": round(100.0 * booked / avail, 1) if avail > 0 else 0.0,
+            "appt_count":      room_appts[room],
+        }
+
+    return {
+        "room_utilization_pct":         round(util_pct, 1),
+        "rooms_used_count":             len(room_booked),
+        "total_booked_room_minutes":    total_booked,
+        "total_available_room_minutes": total_available,
+        "avg_appts_per_room_used":      round(total_appts / len(room_booked), 2),
+        "avg_booked_min_per_room":      round(total_booked / len(room_booked), 1),
+        "room_utilization_by_room":     room_util_by_room,
+    }
+
+
+def compute_kpis(
+    chosen: Dict[Tuple[str, str], "Pattern"],
+    groups: Dict[Tuple[str, str], List[Appointment]],
+) -> Dict:
+    """
+    Compute all KPIs including room utilization.
+
+    Room-utilization metrics (from compute_room_utilization):
+        room_utilization_pct         – % of available room-minutes that are booked
+        rooms_used_count             – distinct rooms used across chosen schedule
+        total_booked_room_minutes    – sum of appointment-minutes in assigned rooms
+        total_available_room_minutes – schedulable room-minutes (denominator)
+        avg_appts_per_room_used      – average # appointments per room used
+        avg_booked_min_per_room      – average booked minutes per room used
+    """
+    total_travel   = 0.0
+    total_penalty  = 0.0
+    total_switches = 0
+    unassigned     = 0
+    single_room_pd = 0
+    provider_days  = 0
+    appts_blocked  = 0
 
     for (prov, date), pat in chosen.items():
         appts = sorted(
             [a for a in groups[(prov, date)] if a.is_active],
             key=lambda a: a.start_min,
         )
-        rooms_seq = [pat.assignment.get(a.appt_id) for a in appts
-                     if a.appt_id in pat.assignment]
-        for r in rooms_seq:
-            if r is None:
-                unassigned += 1
+        blocks = blocked_windows(date)
+        rooms_seq = [pat.assignment.get(a.appt_id)
+                     for a in appts if a.appt_id in pat.assignment]
 
-        switches = sum(1 for r1, r2 in zip(rooms_seq, rooms_seq[1:]) if r1 != r2)
-        total_room_switches += switches
-        total_travel += pat.cost
-        provider_day_count += 1
-        if len(set(r for r in rooms_seq if r is not None)) == 1:
-            providers_single_room += 1
+        unassigned += sum(1 for r in rooms_seq if r is None)
+        total_switches += sum(
+            1 for r1, r2 in zip(rooms_seq, rooms_seq[1:]) if r1 != r2
+        )
+
+        appt_map = {a.appt_id: a for a in appts}
+        for aid in pat.assignment:
+            a = appt_map.get(aid)
+            if a:
+                ov = admin_overlap_minutes(a.start_min, a.end_min, blocks)
+                if ov > 0:
+                    appts_blocked += 1
+                total_penalty += ADMIN_PENALTY_PER_MIN * ov
+
+        pi_dp = compute_Pi_dp(appts)
+        travel = sum(
+            room_distance(
+                pat.assignment.get(i, 0),
+                pat.assignment.get(i_prime, 0),
+            )
+            for (i, i_prime) in pi_dp
+            if i in pat.assignment and i_prime in pat.assignment
+        )
+        total_travel += travel
+        provider_days += 1
+
+        distinct_rooms = {r for r in rooms_seq if r is not None}
+        if len(distinct_rooms) == 1:
+            single_room_pd += 1
+
+    # Room-utilization sub-KPIs
+    util = compute_room_utilization(chosen, groups)
 
     return {
-        "total_travel_m": total_travel,
-        "total_room_switches": total_room_switches,
-        "unassigned_appointments": unassigned,
-        "provider_days_solved": provider_day_count,
-        "provider_days_single_room": providers_single_room,
-        "avg_travel_per_provider_day": (
-            total_travel / provider_day_count if provider_day_count else 0
+        # ── Travel & penalty ──────────────────────────────────────────────────
+        "total_travel_m":                        total_travel,
+        "total_admin_penalty":                   total_penalty,
+        "total_cost_with_penalty":               total_travel + total_penalty,
+        "appts_scheduled_in_blocked_window":     appts_blocked,
+        # ── Scheduling counts ─────────────────────────────────────────────────
+        "total_room_switches":                   total_switches,
+        "unassigned_appointments":               unassigned,
+        "provider_days_solved":                  provider_days,
+        "provider_days_single_room":             single_room_pd,
+        "avg_travel_per_provider_day":           (
+            total_travel / provider_days if provider_days else 0.0
         ),
+        # ── Room utilization ──────────────────────────────────────────────────
+        "room_utilization_pct":                  util["room_utilization_pct"],
+        "rooms_used_count":                      util["rooms_used_count"],
+        "total_booked_room_minutes":             util["total_booked_room_minutes"],
+        "total_available_room_minutes":          util["total_available_room_minutes"],
+        "avg_appts_per_room_used":               util["avg_appts_per_room_used"],
+        "avg_booked_min_per_room":               util["avg_booked_min_per_room"],
+        # stored separately for display_room_utilization()
+        "_room_utilization_by_room":             util["room_utilization_by_room"],
     }
+
+
+def display_room_utilization(kpis: Dict) -> None:
+    """Print the per-room utilization breakdown table."""
+    by_room = kpis.get("_room_utilization_by_room", {})
+    if not by_room:
+        print("  (No room-utilization data.)")
+        return
+
+    print("\n" + "=" * 72)
+    print("ROOM UTILIZATION BREAKDOWN")
+    print(f"  Overall utilization : {kpis['room_utilization_pct']:.1f}%  "
+          f"({kpis['total_booked_room_minutes']} booked / "
+          f"{kpis['total_available_room_minutes']} available minutes)")
+    print(f"  Rooms used          : {kpis['rooms_used_count']} of {NUM_ROOMS}")
+    print(f"  Avg booked / room   : {kpis['avg_booked_min_per_room']:.0f} min")
+    print(f"  Avg appts / room    : {kpis['avg_appts_per_room_used']:.1f}")
+    print("=" * 72)
+    print(f"  {'Room':<8}  {'Booked min':>10}  {'Avail min':>10}  "
+          f"{'Util %':>8}  {'# Appts':>8}")
+    print(f"  {'-'*8}  {'-'*10}  {'-'*10}  {'-'*8}  {'-'*8}")
+    for room, info in sorted(by_room.items()):
+        util_bar = "█" * int(info["utilization_pct"] / 5)  # 1 block per 5 %
+        print(f"  {'ER'+str(room):<8}  {info['booked_min']:>10}  "
+              f"{info['available_min']:>10}  {info['utilization_pct']:>7.1f}%  "
+              f"{info['appt_count']:>8}  {util_bar}")
+    print("=" * 72)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7.  SCHEDULE DISPLAY
 # ──────────────────────────────────────────────────────────────────────────────
 
-def display_schedule(chosen: Dict[Tuple[str, str], Pattern],
-                     groups: Dict[Tuple[str, str], List[Appointment]],
-                     date_filter: Optional[str] = None) -> None:
+def display_schedule(chosen, groups, date_filter=None) -> None:
     print("\n" + "=" * 72)
     print("EXAMINATION ROOM SCHEDULE")
     print("=" * 72)
@@ -1183,59 +1194,41 @@ def display_schedule(chosen: Dict[Tuple[str, str], Pattern],
             key=lambda a: a.start_min,
         )
         print(f"\nProvider: {prov}   Date: {date}   "
-              f"Travel cost: {pat.cost:.1f} m")
+              f"Pattern cost: {pat.cost:.1f}")
         print(f"  {'Appt':>6}  {'Patient':<12}  {'Time':>5}  "
-              f"{'Dur':>4}  {'Room':>4}  {'Type':<20}")
-        print(f"  {'-'*6}  {'-'*12}  {'-'*5}  {'-'*4}  {'-'*4}  {'-'*20}")
+              f"{'Dur':>4}  {'Room':<10}  {'Penalty':>8}  {'Type':<20}")
+        print(f"  {'-'*6}  {'-'*12}  {'-'*5}  {'-'*4}  {'-'*10}  {'-'*8}  {'-'*20}")
 
         blocks = blocked_windows(date)
         for a in appts:
             room = pat.assignment.get(a.appt_id)
-            if room is not None:
-                room_str = f"ER{room:>2}"
-            elif not is_available(a.start_min, a.end_min, blocks):
-                room_str = "BLOCKED"
-            else:
-                room_str = "UNASSIGNED"
+            room_str = f"ER{room}" if room is not None else "UNASSIGNED"
+            overlap  = admin_overlap_minutes(a.start_min, a.end_min, blocks)
+            pen_str  = f"{ADMIN_PENALTY_PER_MIN * overlap:.1f}" if overlap > 0 else "-"
             h, m = divmod(a.start_min, 60)
-            ns_flag = "[NS]" if a.no_show else ""
+            ns_flag   = " [NS]"      if a.no_show else ""
+            blk_flag  = " [BLOCKED]" if overlap > 0 else ""
             print(f"  {a.appt_id:>6}  {a.patient_id:<12}  "
                   f"{h:02d}:{m:02d}  {a.duration:>4}  "
-                  f"{room_str:<10}  {a.appt_type:<20} {ns_flag}")
+                  f"{room_str:<10}  {pen_str:>8}  "
+                  f"{a.appt_type:<20}{ns_flag}{blk_flag}")
 
     print("\n" + "=" * 72)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8.  POLICIES A–F  (Validation – Task 4 of project)
+# 8.  POLICIES A–F
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── Policy A ──────────────────────────────────────────────────────────────────
 def policy_a_single_room(
-    groups: Dict[Tuple[str, str], List[Appointment]],
+    groups,
     week_lock: bool = False,
     cg_iters: int = 3,
-) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
+) -> Tuple[float, Dict[Tuple[str, str], "Pattern"]]:
     """
-    Policy A – Day variant: Assign each provider to a single room for the day.
-
-    Implemented as a column feasibility constraint added to the pattern
-    generator and pricing sub-problem, so it flows through the full CG
-    pipeline.  H_{d,p} is restricted to patterns where every appointment
-    i ∈ A_{d,p} is assigned to the same room r — enforcing:
-
-        Σ_r x_{ird} = 1  ∀i, d   (exactly one room per provider per day)
-
-    with the additional feasibility rule that all appointments in the
-    pattern share that one room.
-
-    Week variant (week_lock=True): after solving independently per day,
-    a post-processing step enforces the same room across all days for
-    each provider by taking the most-used room from the day solutions.
-    Full week-variant CG requires the β_{p,r} binary variable extension
-    to the MP (not yet implemented).
+    Policy A – Day variant: each provider uses a single room for the day.
+    Week variant (week_lock=True): lock to the dominant room across all days.
     """
-    # ── Build initial patterns with single-room constraint ───────────────────
     patterns_map: Dict[Tuple[str, str], List[Pattern]] = {}
     for (prov, date), appts in groups.items():
         active = [a for a in appts if a.is_active]
@@ -1244,53 +1237,43 @@ def policy_a_single_room(
                 active, prov, date, single_room=True
             )
 
-    # ── Run CG with single-room pricing oracle ───────────────────────────────
     patterns_map = column_generation(
         groups, patterns_map, max_iterations=cg_iters, single_room=True
     )
 
-    # ── Solve the restricted MIP ─────────────────────────────────────────────
-    obj, chosen = build_and_solve_master(groups, patterns_map, integer=True)
+    _, chosen = build_and_solve_master(groups, patterns_map, integer=True)
 
-    # ── Week variant post-processing ─────────────────────────────────────────
-    # Lock every provider to their most-used room across all days.
     if week_lock:
         from collections import Counter
         provider_rooms: Dict[str, Counter] = defaultdict(Counter)
         for (prov, date), pat in chosen.items():
-            rooms_used = list(pat.assignment.values())
-            if rooms_used:
-                provider_rooms[prov].update(rooms_used)
+            provider_rooms[prov].update(pat.assignment.values())
 
-        # Re-assign each day's pattern to the provider's dominant room
         pid = max((p.pattern_id for p in chosen.values()), default=0) + 1
         for (prov, date), pat in list(chosen.items()):
             dominant_r = provider_rooms[prov].most_common(1)[0][0]
             new_assignment = {aid: dominant_r for aid in pat.assignment}
-            new_cost = compute_pattern_cost(new_assignment,
-                           [a for a in groups[(prov, date)] if a.is_active])
-            chosen[(prov, date)] = Pattern(pid, prov, date, new_assignment, new_cost)
+            new_cost = compute_pattern_cost(
+                new_assignment,
+                [a for a in groups[(prov, date)] if a.is_active],
+                date=date,
+            )
+            chosen[(prov, date)] = Pattern(
+                pid, prov, date, new_assignment, new_cost)
             pid += 1
 
     total_cost = sum(p.cost for p in chosen.values())
     return total_cost, chosen
 
 
-# ── Policy B ──────────────────────────────────────────────────────────────────
 def policy_b_cluster(
-    groups: Dict[Tuple[str, str], List[Appointment]],
+    groups,
     proximity_threshold: float = 3.0,
     anchor_room: int = 1,
-) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
-    """
-    Policy B: Restrict each (provider, day) to a cluster of rooms all within
-    `proximity_threshold` metres of `anchor_room`.
-
-    This limits how far a provider must walk between consecutive appointments,
-    at the cost of fewer available rooms (possible infeasibility for busy days).
-    Falls back to full room set if no feasible pattern exists in cluster.
-    """
-    cluster = [r for r in ROOMS if room_distance(anchor_room, r) <= proximity_threshold]
+) -> Tuple[float, Dict[Tuple[str, str], "Pattern"]]:
+    """Policy B: restrict each provider-day to rooms within proximity_threshold of anchor."""
+    cluster = [r for r in ROOMS
+               if room_distance(anchor_room, r) <= proximity_threshold]
     if not cluster:
         cluster = ROOMS[:4]
 
@@ -1305,11 +1288,10 @@ def policy_b_cluster(
 
         pats = feasible_room_assignment(active, date, cluster)
         if not pats:
-            # Fallback: use full room set
             pats = feasible_room_assignment(active, date, ROOMS)
 
         if pats:
-            costs = [compute_pattern_cost(p, active) for p in pats]
+            costs = [compute_pattern_cost(p, active, date=date) for p in pats]
             best_idx = int(np.argmin(costs))
             cost = costs[best_idx]
             pat = Pattern(pid, prov, date, pats[best_idx], cost)
@@ -1320,20 +1302,11 @@ def policy_b_cluster(
     return total_cost, chosen
 
 
-# ── Policy C ──────────────────────────────────────────────────────────────────
 def policy_c_blocked_days(
-    groups: Dict[Tuple[str, str], List[Appointment]],
+    groups,
     blocked: Optional[Dict[str, List[str]]] = None,
-) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
-    """
-    Policy C: Block certain days for certain Healthcare Providers.
-
-    `blocked` maps provider_id -> list of date strings that are blocked.
-    Appointments on blocked days are dropped (no room assigned).
-    This models days reserved for admin work, training, or leave.
-
-    Default example blocks HPW114 on Tuesdays (11-11-2025).
-    """
+) -> Tuple[float, Dict[Tuple[str, str], "Pattern"]]:
+    """Policy C: block certain provider-days entirely (admin/leave days)."""
     if blocked is None:
         blocked = {"HPW114": ["11-11-2025"]}
 
@@ -1347,7 +1320,7 @@ def policy_c_blocked_days(
             blocked_count += 1
             print(f"  [Policy C] Blocking {prov} on {date} "
                   f"({len(appts)} appointments dropped).")
-            continue  # skip entirely — day is blocked
+            continue
 
         active = [a for a in appts if a.is_active]
         if not active:
@@ -1355,7 +1328,7 @@ def policy_c_blocked_days(
 
         pats = feasible_room_assignment(active, date, ROOMS)
         if pats:
-            costs = [compute_pattern_cost(p, active) for p in pats]
+            costs = [compute_pattern_cost(p, active, date=date) for p in pats]
             best_idx = int(np.argmin(costs))
             cost = costs[best_idx]
             pat = Pattern(pid, prov, date, pats[best_idx], cost)
@@ -1367,84 +1340,79 @@ def policy_c_blocked_days(
     return total_cost, chosen
 
 
-# ── Policy D ──────────────────────────────────────────────────────────────────
 def policy_d_admin_overflow(
-    groups: Dict[Tuple[str, str], List[Appointment]],
+    groups,
     allow_admin_overflow: bool = True,
     admin_budget_minutes: float = 30.0,
-) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
+) -> Tuple[float, Dict[Tuple[str, str], "Pattern"]]:
     """
     Policy D: Administrative Buffer Time.
 
-    Implements the soft constraint with budget from the formulation:
+    ON  (allow_admin_overflow=True):
+        Appointments in blocked windows ARE schedulable. Each provider-day is
+        capped at admin_budget_minutes of total blocked-window overlap via
+        Constraint 4. The budget is applied per provider-day. If a provider-day's
+        minimum possible overlap exceeds the budget (i.e. the constraint would be
+        infeasible), the budget is raised to that provider-day's actual minimum
+        so the solver always has a feasible solution.
 
-        Σ_{p∈P} Σ_{h∈H_{d,p}} Σ_{i∈A_{d,p}} a^h_{d,p,(r,i)} · α^h_{d,p} · τ_i ≤ B_d
-        ∀d∈D
-
-    where τ_i = minutes of appointment i overlapping an admin block on day d,
-    and B_d = maximum total admin overlap allowed across all providers on day d.
-
-    When allow_admin_overflow=True:
-        - Appointments overlapping admin blocks are included in the pattern
-          generator (they become eligible columns).
-        - The MP enforces that the total overlap across all selected patterns
-          on a given day does not exceed admin_budget_minutes (B_d).
-
-    When allow_admin_overflow=False:
-        - Admin-block appointments are excluded entirely (hard constraint,
-          equivalent to B_d = 0).
+    OFF (allow_admin_overflow=False):
+        Appointments that overlap any blocked window are excluded from pattern
+        generation entirely — hard filter, no Constraint 4 needed.
     """
-    # Build initial patterns including admin-overlap appointments if allowed
     patterns_map: Dict[Tuple[str, str], List[Pattern]] = {}
+
     for (prov, date), appts in groups.items():
         if allow_admin_overflow:
-            # Include all non-cancelled, non-deleted appointments
-            # (admin-block appointments are now eligible columns)
-            active = [a for a in appts if not a.cancelled and not a.deleted]
-        else:
-            # Hard constraint: exclude admin-block appointments entirely
             active = [a for a in appts if a.is_active]
-
+        else:
+            blocks = blocked_windows(date)
+            active = [
+                a for a in appts
+                if a.is_active and
+                   admin_overlap_minutes(a.start_min, a.end_min, blocks) == 0
+            ]
         if active:
-            patterns_map[(prov, date)] = generate_initial_patterns(active, prov, date)
+            patterns_map[(prov, date)] = generate_initial_patterns(
+                active, prov, date)
 
-    # Build admin budget: B_d for each day
     if allow_admin_overflow:
-        all_dates = sorted({date for (_, date) in groups})
-        admin_budget = {date: admin_budget_minutes for date in all_dates}
-    else:
-        admin_budget = None  # no budget constraint needed when hard-blocked
+        # Compute per-provider-day budget: at least the minimum overlap across
+        # all patterns for that provider-day, so the constraint is always feasible.
+        pd_budget: Dict[Tuple[str, str], float] = {}
+        for (prov, date), pats in patterns_map.items():
+            appts_pd = [a for a in groups.get((prov, date), []) if a.is_active]
+            blocks    = blocked_windows(date)
+            min_overlap = float("inf")
+            for pat in pats:
+                pat_overlap = sum(
+                    admin_overlap_minutes(a.start_min, a.end_min, blocks)
+                    for a in appts_pd if pat.covers(a.appt_id)
+                )
+                min_overlap = min(min_overlap, pat_overlap)
+            if min_overlap == float("inf"):
+                min_overlap = 0.0
+            # Use the requested budget, but never below the minimum achievable
+            pd_budget[(prov, date)] = max(admin_budget_minutes, min_overlap)
 
-    # Solve MP with Constraint (4) enforcing the budget
-    obj, chosen = build_and_solve_master(
-        groups, patterns_map, integer=True,
-        admin_budget=admin_budget,
-    )
+        _, chosen = build_and_solve_master(
+            groups, patterns_map, integer=True, admin_budget=pd_budget,
+        )
+    else:
+        _, chosen = build_and_solve_master(
+            groups, patterns_map, integer=True,
+        )
 
     total_cost = sum(p.cost for p in chosen.values())
     return total_cost, chosen
 
 
-# ── Policy E ──────────────────────────────────────────────────────────────────
 def policy_e_overbook(
-    groups: Dict[Tuple[str, str], List[Appointment]],
+    groups,
     no_show_rate: float = 0.10,
     overbook_factor: float = 1.15,
-) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
-    """
-    Policy E: Overbook appointments to account for no-shows.
-
-    Strategy: for each (provider, day), if the observed no-show rate exceeds
-    `no_show_rate`, add extra phantom appointments to fill the freed slots.
-    `overbook_factor` controls how many extra slots to add relative to the
-    expected no-shows (e.g. 1.15 = add 15% more than expected no-shows).
-
-    Observed no-show rate from data is used when available; otherwise the
-    supplied `no_show_rate` default is applied.
-
-    No-show appointments keep their original room assignment so the room is
-    re-usable in practice.  The schedule is otherwise identical to baseline.
-    """
+) -> Tuple[float, Dict[Tuple[str, str], "Pattern"]]:
+    """Policy E: overbook appointments to account for expected no-shows."""
     chosen: Dict[Tuple[str, str], Pattern] = {}
     total_cost = 0.0
     pid = 0
@@ -1452,25 +1420,23 @@ def policy_e_overbook(
 
     for (prov, date), appts in groups.items():
         all_active = [a for a in appts if not a.cancelled and not a.deleted]
-        no_shows = [a for a in all_active if a.no_show]
+        no_shows   = [a for a in all_active if a.no_show]
         real_appts = [a for a in all_active if not a.no_show]
 
-        # Observed rate for this group
-        obs_rate = len(no_shows) / len(all_active) if all_active else no_show_rate
+        obs_rate = (len(no_shows) / len(all_active)
+                    if all_active else no_show_rate)
         expected_no_shows = max(obs_rate * len(all_active), len(no_shows))
         extra_slots = int(np.floor(expected_no_shows * overbook_factor))
         extra_total += extra_slots
 
-        # Include no-show appointments in the schedule (they may not show,
-        # freeing the room for a walk-in or the overbooked slot)
-        schedule_appts = real_appts + no_shows  # treat all as schedulable
-
+        schedule_appts = real_appts + no_shows
         if not schedule_appts:
             continue
 
         pats = feasible_room_assignment(schedule_appts, date, ROOMS)
         if pats:
-            costs = [compute_pattern_cost(p, schedule_appts) for p in pats]
+            costs = [compute_pattern_cost(p, schedule_appts, date=date)
+                     for p in pats]
             best_idx = int(np.argmin(costs))
             cost = costs[best_idx]
             pat = Pattern(pid, prov, date, pats[best_idx], cost)
@@ -1482,37 +1448,15 @@ def policy_e_overbook(
     return total_cost, chosen
 
 
-# ── Policy F ──────────────────────────────────────────────────────────────────
 def policy_f_uncertainty(
-    groups: Dict[Tuple[str, str], List[Appointment]],
+    groups,
     buffer_factor: float = 0.20,
     cg_iters: int = 3,
-) -> Tuple[float, Dict[Tuple[str, str], Pattern]]:
+) -> Tuple[float, Dict[Tuple[str, str], "Pattern"]]:
     """
-    Policy F: Account for uncertainty in examination durations.
-
-    Implements the buffer factor preprocessing step from the formulation:
-
-        d'_i = d_i(1 + μ)
-
-    where d_i is the nominal duration of appointment i and μ is the buffer
-    factor (default 0.20 = 20% inflation).
-
-    These buffered durations replace the original durations when determining
-    whether a provider-day assignment pattern is feasible during generation.
-    All other parts of the model remain unchanged — the buffered durations
-    only affect which columns are feasible in H_{d,p}.
-
-    A larger μ produces more conservative schedules by reserving additional
-    time for each appointment, making it less likely that a running-over
-    appointment causes a room collision.
-
-    This policy is implemented entirely in the preprocessing and column
-    generation stages. The MP formulation is unchanged.
+    Policy F: inflate appointment durations by buffer_factor (d'_i = d_i(1+μ))
+    to account for uncertainty, then solve and remap to nominal durations.
     """
-    # ── Preprocessing: inflate durations by buffer factor μ ──────────────────
-    # Create buffered copies of every appointment: d'_i = d_i * (1 + μ)
-    # These are used only for feasibility checking during pattern generation.
     buffered_groups: Dict[Tuple[str, str], List[Appointment]] = {}
     for (prov, date), appts in groups.items():
         buffered = []
@@ -1520,53 +1464,35 @@ def policy_f_uncertainty(
             if not a.is_active:
                 continue
             buffered_dur = int(np.ceil(a.duration * (1 + buffer_factor)))
-            buffered_a = Appointment(
-                appt_id=a.appt_id,
-                patient_id=a.patient_id,
-                provider=a.provider,
-                date=a.date,
-                start_min=a.start_min,
-                duration=buffered_dur,   # d'_i = d_i * (1 + μ)
-                appt_type=a.appt_type,
-                no_show=a.no_show,
-                cancelled=a.cancelled,
-                deleted=a.deleted,
-            )
-            buffered.append(buffered_a)
+            buffered.append(Appointment(
+                appt_id=a.appt_id, patient_id=a.patient_id,
+                provider=a.provider, date=a.date,
+                start_min=a.start_min, duration=buffered_dur,
+                appt_type=a.appt_type, no_show=a.no_show,
+                cancelled=a.cancelled, deleted=a.deleted,
+            ))
         if buffered:
             buffered_groups[(prov, date)] = buffered
 
-    # ── CG: generate patterns using buffered durations ────────────────────────
-    # Feasibility is checked against d'_i so only patterns with enough
-    # inter-appointment slack are admitted into H_{d,p}.
     patterns_map: Dict[Tuple[str, str], List[Pattern]] = {}
     for (prov, date), buffered_appts in buffered_groups.items():
         patterns_map[(prov, date)] = generate_initial_patterns(
-            buffered_appts, prov, date
-        )
+            buffered_appts, prov, date)
 
     patterns_map = column_generation(buffered_groups, patterns_map, cg_iters)
 
-    # ── MP: solve using buffered patterns ────────────────────────────────────
-    # Cross-provider conflict constraints use appointment overlap timing.
-    # Buffered durations inflate appointments and create artificial overlaps
-    # between providers that don't exist under nominal durations. We skip
-    # Constraint (3) here — the nominal CG solution already enforces it.
-    # Policy F's purpose is to test within-provider pattern feasibility
-    # under duration inflation, not cross-provider conflict resolution.
-    obj, chosen_buffered = build_and_solve_master(
+    _, chosen_buffered = build_and_solve_master(
         buffered_groups, patterns_map, integer=True,
         skip_conflict_constraints=True,
     )
 
-    # Remap pattern assignments back to original appointment objects so
-    # the schedule output uses nominal durations for display.
     chosen: Dict[Tuple[str, str], Pattern] = {}
     pid = 0
     for (prov, date), pat in chosen_buffered.items():
         orig_appts = [a for a in groups.get((prov, date), []) if a.is_active]
-        nominal_cost = compute_pattern_cost(pat.assignment, orig_appts)
-        chosen[(prov, date)] = Pattern(pid, prov, date, pat.assignment, nominal_cost)
+        nominal_cost = compute_pattern_cost(pat.assignment, orig_appts, date=date)
+        chosen[(prov, date)] = Pattern(
+            pid, prov, date, pat.assignment, nominal_cost)
         pid += 1
 
     total_cost = sum(p.cost for p in chosen.values())
@@ -1574,201 +1500,187 @@ def policy_f_uncertainty(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9.  MAIN ENTRY POINT
+# 9.  POLICY COMPARISON TABLE
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_all_policies(
-    groups: Dict[Tuple[str, str], List[Appointment]],
-    optimal_kpis: Dict,
-) -> None:
-    """Run all six policies and print a consolidated comparison table."""
-
-    print("\n" + "=" * 72)
+def run_all_policies(groups, optimal_kpis) -> None:
+    print("\n" + "=" * 80)
     print("POLICY COMPARISON  (Policies A – F  vs  Column-Generation Optimal)")
-    print("=" * 72)
+    print("=" * 80)
 
     policies = [
-        ("A – Single Room (day)",   lambda g: policy_a_single_room(g, week_lock=False)),
-        ("A – Single Room (week)",  lambda g: policy_a_single_room(g, week_lock=True)),
-        ("B – Cluster (≤3 m)",      lambda g: policy_b_cluster(g, proximity_threshold=3.0)),
-        ("B – Cluster (≤5 m)",      lambda g: policy_b_cluster(g, proximity_threshold=5.0)),
-        ("C – Blocked Days",        lambda g: policy_c_blocked_days(g)),
-        ("D – Admin Overflow ON",   lambda g: policy_d_admin_overflow(g, allow_admin_overflow=True)),
-        ("D – Admin Overflow OFF",  lambda g: policy_d_admin_overflow(g, allow_admin_overflow=False)),
-        ("E – Overbook (10% NS)",   lambda g: policy_e_overbook(g, no_show_rate=0.10)),
-        ("F – Uncertainty (σ=20%)", lambda g: policy_f_uncertainty(g, buffer_factor=0.20)),
+        ("A – Single Room (day)",
+         lambda g: policy_a_single_room(g, week_lock=False)),
+        ("A – Single Room (week)",
+         lambda g: policy_a_single_room(g, week_lock=True)),
+        ("B – Cluster (≤3 m)",
+         lambda g: policy_b_cluster(g, proximity_threshold=3.0)),
+        ("B – Cluster (≤5 m)",
+         lambda g: policy_b_cluster(g, proximity_threshold=5.0)),
+        ("C – Blocked Days",
+         lambda g: policy_c_blocked_days(g)),
+        ("D – Admin Overflow ON",
+         lambda g: policy_d_admin_overflow(g, allow_admin_overflow=True)),
+        ("D – Admin Overflow OFF",
+         lambda g: policy_d_admin_overflow(g, allow_admin_overflow=False)),
+        ("E – Overbook (10% NS)",
+         lambda g: policy_e_overbook(g, no_show_rate=0.10)),
+        ("F – Uncertainty (σ=20%)",
+         lambda g: policy_f_uncertainty(g, buffer_factor=0.20)),
     ]
 
+    # Metrics shown in comparison table
     metrics = [
-        "total_travel_m",
-        "total_room_switches",
-        "avg_travel_per_provider_day",
-        "provider_days_solved",
-        "provider_days_single_room",
+        ("total_travel_m",              "Travel (m)"),
+        ("total_admin_penalty",         "Adm Penalty"),
+        ("appts_scheduled_in_blocked_window", "Blk Appts"),
+        ("total_room_switches",         "Rm Switch"),
+        ("room_utilization_pct",        "Rm Util %"),
+        ("rooms_used_count",            "Rms Used"),
+        ("avg_appts_per_room_used",     "Appt/Rm"),
+        ("provider_days_solved",        "PD Solved"),
     ]
 
-    results: List[Tuple[str, Dict]] = []
+    results = []
     for label, fn in policies:
         print(f"\n  Running {label} ...")
         _, chosen = fn(groups)
         kpi = compute_kpis(chosen, groups)
         results.append((label, kpi))
 
-    # Header
-    col_w = 12
+    col_w   = 11
     label_w = 26
     print(f"\n  {'Policy':<{label_w}}", end="")
-    for m in metrics:
-        short = m.replace("_", " ")[:col_w]
-        print(f"  {short:>{col_w}}", end="")
+    for _, header in metrics:
+        print(f"  {header:>{col_w}}", end="")
     print()
     print(f"  {'-'*label_w}", end="")
     for _ in metrics:
         print(f"  {'-'*col_w}", end="")
     print()
 
+    def fmt(v) -> str:
+        if isinstance(v, float):
+            return f"{v:.1f}"
+        return str(v)
+
     # Optimal row
     print(f"  {'Optimal (CG)':<{label_w}}", end="")
-    for m in metrics:
-        v = optimal_kpis.get(m, 0)
-        s = f"{v:.1f}" if isinstance(v, float) else str(v)
-        print(f"  {s:>{col_w}}", end="")
+    for key, _ in metrics:
+        print(f"  {fmt(optimal_kpis.get(key, 0)):>{col_w}}", end="")
     print()
 
     # Policy rows
     for label, kpi in results:
         print(f"  {label:<{label_w}}", end="")
-        for m in metrics:
-            v = kpi.get(m, 0)
-            s = f"{v:.1f}" if isinstance(v, float) else str(v)
-            print(f"  {s:>{col_w}}", end="")
+        for key, _ in metrics:
+            print(f"  {fmt(kpi.get(key, 0)):>{col_w}}", end="")
         print()
 
     print()
 
 
-def export_gantt(
-    chosen: Dict[Tuple[str, str], Pattern],
-    groups: Dict[Tuple[str, str], List[Appointment]],
-    date_filter: Optional[str] = None,
-    output_path: str = "schedule_gantt.png",
-) -> None:
-    """
-    Export the schedule as a Gantt chart PNG.
+# ──────────────────────────────────────────────────────────────────────────────
+# 10. GANTT EXPORT
+# ──────────────────────────────────────────────────────────────────────────────
 
-    Layout:
-      - One chart per day (saved as separate PNGs if multiple days).
-      - Y-axis: Exam rooms (ER1 … ER16).
-      - X-axis: Time of day (minutes from midnight → HH:MM labels).
-      - Each bar = one appointment, coloured by provider.
-      - Bars are labelled with Patient ID (truncated).
-      - Blocked admin/lunch windows shown as grey hatched bands.
-      - No-show appointments shown with diagonal hatching.
-    """
+def export_gantt(
+    chosen,
+    groups,
+    date_filter=None,
+    output_path="schedule_gantt.png",
+):
+    """Export schedule as a Gantt chart PNG.  Blocked-window appointments get a red border."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     from matplotlib.patches import FancyBboxPatch
 
-    # Collect all dates to plot
     dates = sorted({date for (_, date) in chosen.keys()
                     if date_filter is None or date == date_filter})
     if not dates:
         print("  [Gantt] No schedule data to plot.")
         return
 
-    # Colour palette — one colour per provider
     all_providers = sorted({prov for (prov, _) in chosen.keys()})
     cmap = plt.cm.get_cmap("tab20", max(len(all_providers), 1))
     prov_colour = {p: cmap(i) for i, p in enumerate(all_providers)}
-
     saved_files = []
 
     for date in dates:
-        # Operating window for this day
-        blocks = blocked_windows(date)
-        day_start = 8 * 60    # 08:00
-        day_end   = 17 * 60   # 17:00
+        blocks    = blocked_windows(date)
+        day_start = DAY_START_MIN
+        day_end   = DAY_END_MIN
 
-        # Collect all bars for this date
-        bars = []   # (room, start_min, duration, provider, patient_id, no_show)
+        bars = []
         for (prov, d), pat in chosen.items():
             if d != date:
                 continue
-            appts = groups.get((prov, d), [])
-            for a in appts:
+            for a in groups.get((prov, d), []):
                 room = pat.assignment.get(a.appt_id)
                 if room is None:
                     continue
+                overlap = admin_overlap_minutes(a.start_min, a.end_min, blocks)
                 bars.append((room, a.start_min, a.duration,
-                             prov, a.patient_id, a.no_show))
+                             prov, a.patient_id, a.no_show, overlap > 0))
 
         if not bars:
             continue
 
-        # Figure dimensions: one row per room used
         rooms_used = sorted({b[0] for b in bars})
-        n_rooms = len(rooms_used)
-        room_to_y = {r: i for i, r in enumerate(rooms_used)}
+        n_rooms    = len(rooms_used)
+        room_to_y  = {r: i for i, r in enumerate(rooms_used)}
 
         fig_w = max(18, (day_end - day_start) / 30)
         fig_h = max(6, n_rooms * 0.55 + 2)
         fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-        # ── Grey hatched bands for blocked windows ────────────────────────────
         for (bs, be) in blocks:
             ax.axvspan(bs, be, color="lightgrey", alpha=0.5,
                        hatch="//", linewidth=0, zorder=0)
-            mid = (bs + be) / 2
+            mid   = (bs + be) / 2
             label = "Admin" if (be - bs) <= 30 else "Lunch"
             ax.text(mid, n_rooms - 0.3, label, ha="center", va="top",
                     fontsize=6, color="grey", style="italic")
 
-        # ── Appointment bars ──────────────────────────────────────────────────
         bar_h = 0.7
-        for (room, start, dur, prov, patient, no_show) in bars:
-            y = room_to_y[room]
-            colour = prov_colour[prov]
+        for (room, start, dur, prov, patient, no_show, in_block) in bars:
+            y          = room_to_y[room]
+            colour     = prov_colour[prov]
+            edge_color = "red" if in_block else "white"
+            edge_width = 1.5  if in_block else 0.6
 
             rect = FancyBboxPatch(
                 (start, y - bar_h / 2), dur, bar_h,
                 boxstyle="round,pad=1",
-                linewidth=0.6,
-                edgecolor="white",
+                linewidth=edge_width,
+                edgecolor=edge_color,
                 facecolor=colour,
                 alpha=0.5 if no_show else 0.88,
                 zorder=2,
             )
             ax.add_patch(rect)
 
-            # Diagonal hatch for no-shows
             if no_show:
-                hatch_rect = FancyBboxPatch(
+                ax.add_patch(FancyBboxPatch(
                     (start, y - bar_h / 2), dur, bar_h,
                     boxstyle="round,pad=1",
-                    linewidth=0,
-                    edgecolor=colour,
-                    facecolor="none",
-                    hatch="xxx",
-                    zorder=3,
-                )
-                ax.add_patch(hatch_rect)
+                    linewidth=0, edgecolor=colour,
+                    facecolor="none", hatch="xxx", zorder=3,
+                ))
 
-            # Label inside bar (patient id, truncated)
             if dur >= 8:
-                label = patient.replace("Patient ", "P")
-                ax.text(start + dur / 2, y, label,
+                ax.text(start + dur / 2, y,
+                        patient.replace("Patient ", "P"),
                         ha="center", va="center",
                         fontsize=5.5, fontweight="bold",
                         color="white", zorder=4, clip_on=True)
 
-        # ── Y-axis: room labels ───────────────────────────────────────────────
         ax.set_yticks(range(n_rooms))
         ax.set_yticklabels([f"ER{r}" for r in rooms_used], fontsize=8)
         ax.set_ylim(-0.7, n_rooms - 0.3)
 
-        # ── X-axis: time labels ───────────────────────────────────────────────
         tick_mins = list(range(day_start, day_end + 1, 30))
         ax.set_xticks(tick_mins)
         ax.set_xticklabels(
@@ -1778,39 +1690,38 @@ def export_gantt(
         ax.set_xlim(day_start, day_end)
         ax.set_xlabel("Time of Day", fontsize=9)
         ax.set_ylabel("Exam Room", fontsize=9)
-
-        # ── Grid ─────────────────────────────────────────────────────────────
         ax.set_axisbelow(True)
         ax.xaxis.grid(True, linestyle="--", linewidth=0.4, alpha=0.5, zorder=1)
-        ax.yaxis.grid(True, linestyle="-", linewidth=0.3, alpha=0.3, zorder=1)
+        ax.yaxis.grid(True, linestyle="-",  linewidth=0.3, alpha=0.3, zorder=1)
+        ax.set_title(
+            f"Examination Room Schedule — {date}  "
+            f"(red border = admin-window penalty)",
+            fontsize=12, fontweight="bold", pad=10,
+        )
 
-        # ── Title ─────────────────────────────────────────────────────────────
-        ax.set_title(f"Examination Room Schedule — {date}",
-                     fontsize=12, fontweight="bold", pad=10)
-
-        # ── Legend: providers ─────────────────────────────────────────────────
         providers_today = sorted({b[3] for b in bars})
         legend_patches = [
             mpatches.Patch(facecolor=prov_colour[p], label=p, alpha=0.88)
             for p in providers_today
         ]
-        # Add no-show indicator
-        legend_patches.append(
+        legend_patches += [
             mpatches.Patch(facecolor="grey", hatch="xxx",
-                           label="No-Show", alpha=0.5)
-        )
+                           label="No-Show", alpha=0.5),
+            mpatches.Patch(facecolor="white", edgecolor="red",
+                           linewidth=1.5, label="Admin-window penalty"),
+        ]
         ax.legend(handles=legend_patches, loc="upper right",
-                  fontsize=7, ncol=max(1, len(providers_today) // 6 + 1),
+                  fontsize=7,
+                  ncol=max(1, len(providers_today) // 6 + 1),
                   framealpha=0.9, title="Provider", title_fontsize=7)
 
         plt.tight_layout()
 
-        # ── Save ─────────────────────────────────────────────────────────────
         if len(dates) == 1:
             fname = output_path
         else:
-            base, ext = output_path.rsplit(".", 1) if "." in output_path \
-                        else (output_path, "png")
+            base, ext = (output_path.rsplit(".", 1)
+                         if "." in output_path else (output_path, "png"))
             fname = f"{base}_{date}.{ext}"
 
         fig.savefig(fname, dpi=180, bbox_inches="tight")
@@ -1821,14 +1732,24 @@ def export_gantt(
     return saved_files
 
 
-def main(csv_path: str, day_filter: Optional[str] = None,
-         max_cg_iters: int = 3, print_matrices: bool = False,
-         gantt: bool = False, gantt_path: str = "schedule_gantt.png") -> None:
+# ──────────────────────────────────────────────────────────────────────────────
+# 11. MAIN ENTRY POINT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main(
+    csv_path: str,
+    day_filter: Optional[str] = None,
+    max_cg_iters: int = 3,
+    print_matrices: bool = False,
+    gantt: bool = False,
+    gantt_path: str = "schedule_gantt.png",
+    penalty_per_min: float = ADMIN_PENALTY_PER_MIN,
+) -> None:
     print(f"\nLoading appointments from: {csv_path}")
+    print(f"Admin-window soft penalty : {penalty_per_min:.1f} per overlapping minute")
     all_appts = load_appointments(csv_path)
     print(f"  Loaded {len(all_appts)} appointments (after filtering 0-duration).")
 
-    # Group by (provider, date)
     groups: Dict[Tuple[str, str], List[Appointment]] = defaultdict(list)
     for a in all_appts:
         groups[(a.provider, a.date)].append(a)
@@ -1838,8 +1759,8 @@ def main(csv_path: str, day_filter: Optional[str] = None,
         print(f"  Filtered to date: {day_filter}  "
               f"({len(groups)} provider-day groups)")
 
-    # ── Initial pattern generation (Pricing Sub-Problem) ──────────────────────
-    print("\n=== Generating Initial Patterns (Pricing Sub-Problem) ===")
+    # ── Initial pattern generation ────────────────────────────────────────────
+    print("\n=== Generating Initial Patterns ===")
     patterns_map: Dict[Tuple[str, str], List[Pattern]] = {}
     total_initial = 0
     for (prov, date), appts in groups.items():
@@ -1855,8 +1776,11 @@ def main(csv_path: str, day_filter: Optional[str] = None,
 
     # ── Column generation ─────────────────────────────────────────────────────
     if max_cg_iters > 0:
-        patterns_map = column_generation(groups, patterns_map, max_cg_iters,
-                                         print_matrices=print_matrices)
+        patterns_map = column_generation(
+            groups, patterns_map, max_cg_iters,
+            print_matrices=print_matrices,
+            penalty_per_min=penalty_per_min,
+        )
 
     # ── Solve integer Master Problem ──────────────────────────────────────────
     print("\n=== Solving Integer Master Problem (MIP) ===")
@@ -1865,27 +1789,34 @@ def main(csv_path: str, day_filter: Optional[str] = None,
         print_matrices=print_matrices,
         iteration_label="Final MIP Solve",
     )
-    print(f"  Optimal total travel distance: {obj:.2f} m")
+    print(f"  Optimal total cost (travel + penalty): {obj:.2f}")
 
-    # ── Display optimal schedule ──────────────────────────────────────────────
+    # ── Display schedule ──────────────────────────────────────────────────────
     display_schedule(chosen_opt, groups, date_filter=day_filter)
 
-    # ── Gantt chart export ────────────────────────────────────────────────────
+    # ── Gantt export ──────────────────────────────────────────────────────────
     if gantt:
         print("\n=== Exporting Gantt Chart ===")
         export_gantt(chosen_opt, groups,
                      date_filter=day_filter, output_path=gantt_path)
 
-    # ── KPIs for optimal ─────────────────────────────────────────────────────
+    # ── KPIs ──────────────────────────────────────────────────────────────────
     kpis_opt = compute_kpis(chosen_opt, groups)
-    print("\n=== Optimal Schedule KPIs ===")
-    for k, v in kpis_opt.items():
-        if isinstance(v, float):
-            print(f"  {k:<40}: {v:.2f}")
-        else:
-            print(f"  {k:<40}: {v}")
 
-    # ── Run all six policies and compare ─────────────────────────────────────
+    print("\n=== Optimal Schedule KPIs ===")
+    skip = {"_room_utilization_by_room"}
+    for k, v in kpis_opt.items():
+        if k in skip:
+            continue
+        if isinstance(v, float):
+            print(f"  {k:<45}: {v:.2f}")
+        else:
+            print(f"  {k:<45}: {v}")
+
+    # ── Room-utilization breakdown ────────────────────────────────────────────
+    display_room_utilization(kpis_opt)
+
+    # ── Policy comparison ─────────────────────────────────────────────────────
     run_all_policies(groups, kpis_opt)
 
     print("Done.")
@@ -1894,12 +1825,12 @@ def main(csv_path: str, day_filter: Optional[str] = None,
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="MSE 435 Examination Room Scheduler – Policies A–F"
+        description="MSE 435 Examination Room Scheduler – soft admin-window constraints"
     )
-    parser.add_argument("--csv", default="AppointmentDataWeek1.csv",
+    parser.add_argument("--csv",  default="AppointmentDataWeek1.csv",
                         help="Path to appointment CSV file")
-    parser.add_argument("--day", default=None,
-                        help="Filter to a single date (MM-DD-YYYY), e.g. 11-10-2025")
+    parser.add_argument("--day",  default=None,
+                        help="Filter to a single date (MM-DD-YYYY)")
     parser.add_argument("--cg-iters", type=int, default=3,
                         help="Max column generation iterations (0 to skip CG)")
     parser.add_argument("--print-matrices", action="store_true",
@@ -1907,10 +1838,22 @@ if __name__ == "__main__":
     parser.add_argument("--gantt", action="store_true",
                         help="Export schedule as a Gantt chart PNG")
     parser.add_argument("--gantt-path", default="schedule_gantt.png",
-                        help="Output path for Gantt PNG (default: schedule_gantt.png)")
+                        help="Output path for Gantt PNG")
+    parser.add_argument(
+        "--penalty", type=float, default=ADMIN_PENALTY_PER_MIN,
+        help=f"Admin-window penalty per overlapping minute "
+             f"(default: {ADMIN_PENALTY_PER_MIN})",
+    )
     args = parser.parse_args()
-    main(csv_path=args.csv, day_filter=args.day, max_cg_iters=args.cg_iters,
-         print_matrices=args.print_matrices,
-         gantt=args.gantt, gantt_path=args.gantt_path)
-    
-    # The use of GEN-AI was used to assist in coding up the column generation formulation, MP, and the policies A-F.
+    main(
+        csv_path=args.csv,
+        day_filter=args.day,
+        max_cg_iters=args.cg_iters,
+        print_matrices=args.print_matrices,
+        gantt=args.gantt,
+        gantt_path=args.gantt_path,
+        penalty_per_min=args.penalty,
+    )
+
+# The use of GEN-AI was used to assist in coding up the column generation
+# formulation, MP, the policies A-F, and the room-utilization KPI.

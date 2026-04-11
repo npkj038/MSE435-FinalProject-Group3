@@ -28,11 +28,14 @@ from openpyxl.utils import get_column_letter
 # ── import scheduler internals ────────────────────────────────────────────────
 sys.path.insert(0, ".")
 from hospital_room_scheduler import (
-    load_appointments, generate_initial_patterns, build_and_solve_master,
-    column_generation, compute_kpis, ROOMS, Appointment, Pattern,
+    load_appointments, generate_initial_patterns, generate_patterns,
+    build_and_solve_master, column_generation, compute_kpis,
+    ROOMS, Appointment, Pattern,
     policy_a_single_room, policy_b_cluster, policy_c_blocked_days,
     policy_d_admin_overflow, policy_e_overbook, policy_f_uncertainty,
     blocked_windows, is_available,
+    admin_overlap_minutes, ADMIN_PENALTY_PER_MIN,
+    compute_room_utilization,
 )
 
 # ── colour palette ────────────────────────────────────────────────────────────
@@ -43,6 +46,7 @@ CLR_ACCENT       = "F2C94C"   # amber (admin/blocked)
 CLR_NOSHOW       = "F4B8B8"   # soft red
 CLR_APPT         = "C6EFCE"   # light green (assigned)
 CLR_BLOCKED_APPT = "FFE699"   # amber — appointment in a blocked window
+CLR_PENALTY      = "FFC7CE"   # light red — appointment with admin penalty
 CLR_WHITE        = "FFFFFF"
 CLR_ALT_ROW      = "EBF3FB"   # alternating row tint
 
@@ -114,11 +118,12 @@ def write_schedule_sheet(
 
     # Column headers
     headers = ["Provider", "Patient ID", "Appt ID", "Start", "End",
-               "Duration (min)", "Room", "Appt Type", "No-Show"]
+               "Duration (min)", "Room", "Appt Type", "No-Show",
+               "Admin Overlap (min)", "Penalty"]
     for col, h in enumerate(headers, start=1):
         _header_cell(ws, 2, col, h, dark=False)
 
-    col_widths = [12, 14, 9, 8, 8, 15, 7, 24, 9]
+    col_widths = [12, 14, 9, 8, 8, 15, 7, 24, 9, 20, 10]
     for col, w in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(col)].width = w
     ws.row_dimensions[1].height = 22
@@ -134,6 +139,8 @@ def write_schedule_sheet(
             room = pat.assignment.get(a.appt_id)
             blocks = blocked_windows(date)
             is_blocked = not is_available(a.start_min, a.end_min, blocks)
+            overlap_min = admin_overlap_minutes(a.start_min, a.end_min, blocks)
+            penalty_val = round(ADMIN_PENALTY_PER_MIN * overlap_min, 2) if overlap_min > 0 else ""
 
             if room is not None:
                 room_str = f"ER{room}"
@@ -152,9 +159,13 @@ def write_schedule_sheet(
                 room_str,
                 a.appt_type or "",
                 "Yes" if a.no_show else "No",
+                overlap_min if overlap_min > 0 else "",
+                penalty_val,
             ]
             if a.no_show:
                 bg = CLR_NOSHOW
+            elif overlap_min > 0:
+                bg = CLR_PENALTY
             elif is_blocked:
                 bg = CLR_BLOCKED_APPT
             elif data_row % 2 == 0:
@@ -167,7 +178,7 @@ def write_schedule_sheet(
                 cell.fill      = _fill(bg)
                 cell.border    = BORDER_THIN
                 cell.font      = _font(size=9)
-                cell.alignment = _center() if col in (1, 3, 4, 5, 6, 7, 9) else _left()
+                cell.alignment = _center() if col in (1, 3, 4, 5, 6, 7, 9, 10, 11) else _left()
             data_row += 1
 
     # Summary row
@@ -178,7 +189,7 @@ def write_schedule_sheet(
     ws.cell(row=data_row, column=1, value="TOTAL APPOINTMENTS")
     ws.cell(row=data_row, column=1).font = _font(bold=True, size=9)
     ws.cell(row=data_row, column=6, value=f'=COUNTA(F3:F{data_row-1})')
-    for col in range(1, 10):
+    for col in range(1, 12):
         ws.cell(row=data_row, column=col).fill   = _fill(CLR_HEADER_LIGHT)
         ws.cell(row=data_row, column=col).border = BORDER_THIN
         ws.cell(row=data_row, column=col).font   = _font(bold=True, size=9)
@@ -195,7 +206,7 @@ def write_appointments_sheet(
 ) -> None:
     ws = wb.create_sheet(title="Appointments")
 
-    ws.merge_cells("A1:K1")
+    ws.merge_cells("A1:M1")
     ws["A1"].value     = "All Assigned Appointments"
     ws["A1"].font      = _font(bold=True, color=CLR_WHITE, size=13)
     ws["A1"].fill      = _fill(CLR_HEADER_DARK)
@@ -203,11 +214,12 @@ def write_appointments_sheet(
 
     headers = ["Date", "Provider", "Patient ID", "Appt ID",
                "Start", "End", "Duration (min)", "Room",
-               "Appt Type", "No-Show", "Travel Cost (m)"]
+               "Appt Type", "No-Show", "Admin Overlap (min)",
+               "Penalty", "Travel Cost (m)"]
     for col, h in enumerate(headers, start=1):
         _header_cell(ws, 2, col, h, dark=False)
 
-    widths = [12, 10, 14, 9, 8, 8, 15, 7, 24, 9, 15]
+    widths = [12, 10, 14, 9, 8, 8, 15, 7, 24, 9, 20, 10, 15]
     for col, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col)].width = w
 
@@ -221,13 +233,22 @@ def write_appointments_sheet(
             room = pat.assignment.get(a.appt_id)
             blocks = blocked_windows(date)
             is_blocked = not is_available(a.start_min, a.end_min, blocks)
+            overlap_min = admin_overlap_minutes(a.start_min, a.end_min, blocks)
+            penalty_val = round(ADMIN_PENALTY_PER_MIN * overlap_min, 2) if overlap_min > 0 else ""
             if room is not None:
                 room_str = f"ER{room}"
             elif is_blocked:
                 room_str = "BLOCKED"
             else:
                 room_str = "UNASSIGNED"
-            bg = CLR_NOSHOW if a.no_show else (CLR_BLOCKED_APPT if is_blocked else (CLR_ALT_ROW if row % 2 == 0 else CLR_WHITE))
+            if a.no_show:
+                bg = CLR_NOSHOW
+            elif overlap_min > 0:
+                bg = CLR_PENALTY
+            elif is_blocked:
+                bg = CLR_BLOCKED_APPT
+            else:
+                bg = CLR_ALT_ROW if row % 2 == 0 else CLR_WHITE
             vals = [
                 date, prov, a.patient_id, a.appt_id,
                 _minutes_to_str(a.start_min),
@@ -236,6 +257,8 @@ def write_appointments_sheet(
                 room_str,
                 a.appt_type or "",
                 "Yes" if a.no_show else "No",
+                overlap_min if overlap_min > 0 else "",
+                penalty_val,
                 round(pat.cost, 2) if a == appts[0] else "",
             ]
             for col, v in enumerate(vals, start=1):
@@ -247,7 +270,7 @@ def write_appointments_sheet(
             row += 1
 
     ws.freeze_panes = "A3"
-    ws.auto_filter.ref = f"A2:K{row-1}"
+    ws.auto_filter.ref = f"A2:M{row-1}"
 
 
 # ── Sheet 3: KPIs ─────────────────────────────────────────────────────────────
@@ -273,12 +296,21 @@ def write_kpi_sheet(
     _header_cell(ws, 2, 3, "Unit",    dark=False)
 
     kpi_rows = [
-        ("Total travel distance",           "total_travel_m",                "metres"),
-        ("Total room switches",              "total_room_switches",           "count"),
-        ("Unassigned appointments",          "unassigned_appointments",       "count"),
-        ("Provider-days solved",             "provider_days_solved",          "count"),
-        ("Provider-days using single room",  "provider_days_single_room",     "count"),
-        ("Avg travel per provider-day",      "avg_travel_per_provider_day",   "metres"),
+        ("Total travel distance",                    "total_travel_m",                        "metres"),
+        ("Total admin penalty",                      "total_admin_penalty",                   "cost units"),
+        ("Total cost (travel + penalty)",            "total_cost_with_penalty",               "cost units"),
+        ("Appointments in blocked window",           "appts_scheduled_in_blocked_window",     "count"),
+        ("Total room switches",                      "total_room_switches",                   "count"),
+        ("Unassigned appointments",                  "unassigned_appointments",               "count"),
+        ("Provider-days solved",                     "provider_days_solved",                  "count"),
+        ("Provider-days using single room",          "provider_days_single_room",             "count"),
+        ("Avg travel per provider-day",              "avg_travel_per_provider_day",           "metres"),
+        ("Room utilization",                         "room_utilization_pct",                  "%"),
+        ("Rooms used (of 16)",                       "rooms_used_count",                      "count"),
+        ("Total booked room-minutes",                "total_booked_room_minutes",             "minutes"),
+        ("Total available room-minutes",             "total_available_room_minutes",          "minutes"),
+        ("Avg appointments per room used",           "avg_appts_per_room_used",               "count"),
+        ("Avg booked minutes per room used",         "avg_booked_min_per_room",               "minutes"),
     ]
 
     for r, (label, key, unit) in enumerate(kpi_rows, start=3):
@@ -303,7 +335,7 @@ def write_policy_sheet(
 ) -> None:
     ws = wb.create_sheet(title="Policy Comparison")
 
-    ws.merge_cells("A1:H1")
+    ws.merge_cells("A1:J1")
     ws["A1"].value     = "Policy Comparison  –  Policies A–F  vs  Column Generation Optimal"
     ws["A1"].font      = _font(bold=True, color=CLR_WHITE, size=13)
     ws["A1"].fill      = _fill(CLR_HEADER_DARK)
@@ -311,10 +343,13 @@ def write_policy_sheet(
 
     metrics = [
         ("Total Travel (m)",           "total_travel_m"),
-        ("Room Switches",               "total_room_switches"),
-        ("Avg Travel/Provider-Day (m)", "avg_travel_per_provider_day"),
-        ("Provider-Days Solved",        "provider_days_solved"),
-        ("Single-Room Days",            "provider_days_single_room"),
+        ("Admin Penalty",              "total_admin_penalty"),
+        ("Blk Appts",                  "appts_scheduled_in_blocked_window"),
+        ("Room Switches",              "total_room_switches"),
+        ("Rm Util %",                  "room_utilization_pct"),
+        ("Rms Used",                   "rooms_used_count"),
+        ("Avg Travel/PD (m)",          "avg_travel_per_provider_day"),
+        ("PD Solved",                  "provider_days_solved"),
     ]
     col_headers = ["Policy"] + [m[0] for m in metrics] + ["Notes"]
     for col, h in enumerate(col_headers, start=1):
@@ -328,12 +363,12 @@ def write_policy_sheet(
     policies = [
         ("Optimal (CG)",
          None,
-         "Column generation optimal — all 3 constraints enforced"),
+         "Column generation optimal — travel + admin-penalty soft constraints"),
         ("A – Single Room (day)",
-         lambda g: policy_a_single_room(g, week_lock=False, cg_iters=1),
+         lambda g: policy_a_single_room(g, week_lock=False, cg_iters=3),
          "H_{d,p} restricted to single-room patterns via CG feasibility constraint"),
         ("A – Single Room (week)",
-         lambda g: policy_a_single_room(g, week_lock=True, cg_iters=1),
+         lambda g: policy_a_single_room(g, week_lock=True, cg_iters=3),
          "Same as day variant with post-processing to enforce consistent weekly room"),
         ("B – Cluster (≤3 m)",
          lambda g: policy_b_cluster(g, proximity_threshold=3.0),
@@ -347,18 +382,18 @@ def write_policy_sheet(
         ("D – Admin Buffer ON (B=30min)",
          lambda g: policy_d_admin_overflow(g, allow_admin_overflow=True,
                                            admin_budget_minutes=30),
-         "MP Constraint (4): Σ τ_i · α ≤ B_d=30min per day"),
+         "Constraint (4) per provider-day: budget = max(30, min_overlap) — always feasible cap on blocked-window overlap"),
         ("D – Admin Buffer OFF",
          lambda g: policy_d_admin_overflow(g, allow_admin_overflow=False),
-         "Hard block: admin-window appointments excluded from pattern generator"),
+         "Hard filter: appointments overlapping any blocked window excluded from pattern generation"),
         ("E – Overbook (10% NS)",
          lambda g: policy_e_overbook(g, no_show_rate=0.10),
          "Σ x_{ird} ≤ capacity_r + δ_r: no-shows included in schedule"),
         ("F – Buffer Factor μ=20%",
-         lambda g: policy_f_uncertainty(g, buffer_factor=0.20, cg_iters=1),
+         lambda g: policy_f_uncertainty(g, buffer_factor=0.20, cg_iters=3),
          "d'_i = d_i(1+μ): buffered durations in preprocessing and CG only"),
         ("F – Buffer Factor μ=10%",
-         lambda g: policy_f_uncertainty(g, buffer_factor=0.10, cg_iters=1),
+         lambda g: policy_f_uncertainty(g, buffer_factor=0.10, cg_iters=3),
          "d'_i = d_i(1+μ): less conservative buffer for comparison"),
     ]
 
@@ -393,7 +428,7 @@ def write_policy_sheet(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(csv_path: str, day_filter: Optional[str], out_path: str,
-         cg_iters: int = 1) -> None:
+         cg_iters: int = 3, penalty_per_min: float = ADMIN_PENALTY_PER_MIN) -> None:
 
     print(f"Loading appointments from {csv_path} ...")
     all_appts = load_appointments(csv_path)
@@ -412,12 +447,15 @@ def main(csv_path: str, day_filter: Optional[str], out_path: str,
     for (prov, date), appts in groups.items():
         active = [a for a in appts if a.is_active]
         if active:
-            patterns_map[(prov, date)] = generate_initial_patterns(active, prov, date)
+            patterns_map[(prov, date)] = generate_patterns(active, prov, date)
 
     # Column generation
     if cg_iters > 0:
         print(f"Running column generation ({cg_iters} iterations) ...")
-        patterns_map = column_generation(groups, patterns_map, cg_iters)
+        patterns_map = column_generation(
+            groups, patterns_map, cg_iters,
+            penalty_per_min=penalty_per_min,
+        )
 
     # Solve MIP
     print("Solving integer master problem ...")
@@ -449,8 +487,13 @@ if __name__ == "__main__":
     parser.add_argument("--csv",  default="AppointmentDataWeek1.csv")
     parser.add_argument("--day",  default=None)
     parser.add_argument("--out",  default="schedule_output.xlsx")
-    parser.add_argument("--cg-iters", type=int, default=1)
+    parser.add_argument("--cg-iters", type=int, default=3)
+    parser.add_argument(
+        "--penalty", type=float, default=ADMIN_PENALTY_PER_MIN,
+        help=f"Admin-window penalty per overlapping minute "
+             f"(default: {ADMIN_PENALTY_PER_MIN})",
+    )
     args = parser.parse_args()
-    main(args.csv, args.day, args.out, args.cg_iters)
+    main(args.csv, args.day, args.out, args.cg_iters, args.penalty)
     
     # The use of GEN-AI was used to assist exporting the output of the model in a well-formatted Excel workbook, including the design of the sheets, the formatting, and the policy comparison.
